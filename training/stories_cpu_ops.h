@@ -67,11 +67,12 @@ static void adam_update(float *w, const float *g, AdamState *s, int t, float lr,
 // logits[v*SEQ+t] = logit for vocab v, position t
 // targets[t] = target token id for position t
 // Returns mean CE loss, writes dlogits = softmax(logits) - one_hot(targets)
-// Data is column-major [V, S], but we process per-column (stride=1 within col is v*S+t, stride between v's is S)
-// For vDSP: transpose to row-major scratch [S, V] to vectorize softmax per position
+// Transpose to [S,V] for contiguous per-position softmax (128KB/row fits L1)
+static float *g_xent_buf = NULL;
 static float cross_entropy_loss(float *dlogits, const float *logits, const uint16_t *targets, int V, int S) {
-    // Work in transposed layout [S, V] where each row is one position's logits (contiguous)
-    float *buf = (float*)malloc(S * V * 4);
+    if (!g_xent_buf) g_xent_buf = (float*)malloc((size_t)S * V * 4);
+    float *buf = g_xent_buf;
+
     // Transpose [V,S] → [S,V]: buf[t*V+v] = logits[v*S+t]
     vDSP_mtrans(logits, 1, buf, 1, (vDSP_Length)S, (vDSP_Length)V);
 
@@ -79,31 +80,22 @@ static float cross_entropy_loss(float *dlogits, const float *logits, const uint1
     float invS = 1.0f / S;
     for (int t = 0; t < S; t++) {
         float *row = buf + t * V;
-        // max
         float maxv;
         vDSP_maxv(row, 1, &maxv, (vDSP_Length)V);
-        // row -= maxv
         float neg_max = -maxv;
         vDSP_vsadd(row, 1, &neg_max, row, 1, (vDSP_Length)V);
-        // exp in-place
         int n = V;
         vvexpf(row, row, &n);
-        // sum
         float sum;
         vDSP_sve(row, 1, &sum, (vDSP_Length)V);
-        // normalize
         float inv_sum = 1.0f / sum;
         vDSP_vsmul(row, 1, &inv_sum, row, 1, (vDSP_Length)V);
-        // loss
-        int tgt = targets[t];
-        total_loss -= logf(row[tgt] + 1e-10f);
-        // gradient: softmax - one_hot, then /S
-        row[tgt] -= 1.0f;
+        total_loss -= logf(row[targets[t]] + 1e-10f);
+        row[targets[t]] -= 1.0f;
         vDSP_vsmul(row, 1, &invS, row, 1, (vDSP_Length)V);
     }
     // Transpose back [S,V] → [V,S]
     vDSP_mtrans(buf, 1, dlogits, 1, (vDSP_Length)V, (vDSP_Length)S);
-    free(buf);
     return total_loss / S;
 }
 
