@@ -146,6 +146,38 @@ Removed dead `o_out` and `ffn_out` fields from `LayerActs` struct.
 
 ---
 
+## Hivemind Analysis: Fused Cross-Entropy on ANE
+
+**Session:** `findings/hivemind-next-opt.md` (fib mode, Claude+Gemini+DeepSeek, 3 rounds)
+
+**Claim tested:** "Fusing cross-entropy softmax into the ANE classifier kernel eliminates the 16.5ms xent CPU cost."
+
+### Key findings
+
+**Approach — tiled softmax with index decomposition:**
+- Reshape 32K vocab to `[512, 64]` tiled layout matching ANE vector unit width
+- Two-pass reduction: local max/sum over inner 64, then rescale across 512 tiles
+- Express target selection via index decomposition (`tile = t // 64`, `offset = t % 64`) + broadcast comparison, not a 16MB one-hot mask. Total IO: 512 bytes of target indices
+- The tiling naturally provides blockwise log-sum-exp, improving fp16 numerical stability vs flat 32K accumulation
+
+**Backward is simpler than forward:**
+- Closed-form gradient: `∂L/∂logits = softmax(x) - one_hot(target)` — pure elementwise, no reductions
+- Cache only the LSE scalar (8 bytes/token) from forward, recompute probs as `exp(logits - LSE)`
+- Avoids both 128MB activation cache and full forward recompute
+- Same index decomposition regenerates the one-hot mask on-the-fly
+
+**Unanswered question (deferred):**
+- Does the `∂L/∂W_cls` sgemm (VOCAB×DIM×SEQ = 6.3 GFLOP) overlap cleanly with ANE, or does fusing xent change the sync dynamics? The 48ms unaccounted time already includes this overlap. Can answer empirically if we build the kernel.
+
+**Risk assessment:**
+- High compiler risk: `reduce_max`/`reduce_sum` over reshaped tensors, `mb.gather` on small LUTs — any of these could trigger CPU fallback
+- MIL graph partitioning is brittle with tiled reductions + LUT patterns
+- Workarounds mentioned (identity nodes, optimization_level=0) are speculative
+
+**Verdict:** Biggest potential win (16.5ms) but highest risk. Treat as a research spike, not a safe optimization.
+
+---
+
 ## Remaining Optimization Targets
 
 Current profile (20 steps, accum=50):
@@ -157,19 +189,16 @@ Current profile (20 steps, accum=50):
 
 ~48ms unaccounted — async dW cblas overlap + scheduling overhead.
 
-### High potential
-1. **xent=16.5ms** — Move softmax to ANE or fuse with classifier kernel. 32K channels work. Would eliminate logits fp32 round-trip.
-2. **ane=10.3ms** — ANE kernel latency is now the single largest timed component. Fusing rmsnorm into adjacent convs could reduce kernel count and dispatch overhead.
-3. **rms_bwd=9.1ms** — 25 calls/step. Could move to ANE or fuse with backward kernels.
-4. **memcpy=8.9ms** — Double-buffer activation storage instead of malloc+memcpy per step.
+### Prioritized by risk-adjusted impact
 
-### Lower potential
-5. **io=4.7ms** — fp32↔fp16 conversion overhead. Could keep activations in fp16 to skip conversion entirely.
-6. **embed_bwd=3.9ms** — Embed dW wait + scatter-add. Much improved from parallel dispatch.
-7. **resid=1.1ms** — Only backward-pass residual adds remain. Could fuse into backward ANE kernels.
+1. **memcpy=8.9ms** — Double-buffer activation capture. Replace per-step malloc+memcpy with persistent ping-pong buffers per layer. Pure C, zero ANE risk. **~9ms, low risk.**
+2. **rms_bwd=9.1ms** — Move rmsnorm_bwd to ANE. 25 calls/step. Involves elementwise ops + reduction (similar to forward rmsnorm already on ANE). **~9ms, medium risk.**
+3. **xent=16.5ms** — Fused cross-entropy on ANE (see hivemind analysis above). **~16ms, high risk.** Treat as research spike.
+4. **io=4.7ms** — Keep activations in fp16 end-to-end, skip fp32↔fp16 conversion. Requires numerical stability analysis for backward pass. **~5ms, medium risk.**
+5. **embed_bwd=3.9ms** — Embed dW wait + scatter-add. Could transpose or use NEON gather for strided access. **~4ms, medium effort.**
+6. **resid=1.1ms** — Backward residual adds. Could fuse into backward ANE kernels. **~1ms, diminishing returns.**
 
-### Architecture-level
-- Keep activations in fp16 end-to-end (eliminate io conversion entirely)
-- Fuse rmsnorm + conv into single ANE kernel (reduce kernel dispatch count)
-- Pipeline: overlap step N's backward with step N+1's forward on ANE (double-buffer IOSurfaces)
-- Fuse cross-entropy softmax with classifier kernel on ANE
+### Architecture-level (larger refactors)
+- Fuse rmsnorm + conv into single ANE kernel (reduce 74 kernel evals/step)
+- Pipeline: overlap step N's backward with step N+1's forward (double-buffer IOSurfaces)
+- Full fp16 activation path (eliminate io conversion entirely)
