@@ -418,7 +418,8 @@ int main(int argc, char *argv[]) {
 
             int steps_batch = 0;
             uint64_t tt = mach_absolute_time();
-            double t_ane=0,t_io=0,t_elem=0,t_rms=0,t_cblas_wait=0,t_cls=0;
+            double t_ane=0,t_io=0,t_rms=0,t_cblas_wait=0,t_cls=0;
+            double t_embed=0,t_resid=0,t_xent=0,t_memcpy=0,t_rms_bwd=0,t_embed_bwd=0;
 
             for (int a=0; a<accum_steps && step<total_steps; a++, step++) {
                 uint64_t t0,t1;
@@ -431,14 +432,16 @@ int main(int argc, char *argv[]) {
                 // Embedding lookup → x_cur [DIM, SEQ] channel-first
                 t0=mach_absolute_time();
                 embed_lookup(x_cur, embed, input_tokens, DIM, SEQ);
-                t1=mach_absolute_time(); t_elem+=tb_ms(t1-t0);
+                t1=mach_absolute_time(); t_embed+=tb_ms(t1-t0);
 
                 // ===== FORWARD (12 layers) =====
                 for (int L=0; L<NLAYERS; L++) {
                     LayerActs *ac = &acts[L];
 
                     // Save layer input for rmsnorm1 backward
+                    t0=mach_absolute_time();
                     memcpy(ac->layer_in, x_cur, SEQ*DIM*4);
+                    t1=mach_absolute_time(); t_memcpy+=tb_ms(t1-t0);
                     // Attention forward: x_cur → o_out,Q,K,V,attn_out,xnorm
                     t0=mach_absolute_time();
                     dispatch_group_wait(dw_grp, DISPATCH_TIME_FOREVER);
@@ -453,7 +456,7 @@ int main(int argc, char *argv[]) {
                     t1=mach_absolute_time(); t_io+=tb_ms(t1-t0); t0=t1;
 
                     vDSP_vadd(x_cur, 1, ac->o_out, 1, ac->x2, 1, (vDSP_Length)(SEQ*DIM));
-                    t1=mach_absolute_time(); t_elem+=tb_ms(t1-t0); t0=t1;
+                    t1=mach_absolute_time(); t_resid+=tb_ms(t1-t0); t0=t1;
 
                     // FFN forward
                     io_write_fp16(kern[L].fwdFFN->ioIn, ac->x2, DIM, SEQ);
@@ -468,7 +471,7 @@ int main(int argc, char *argv[]) {
                     t1=mach_absolute_time(); t_io+=tb_ms(t1-t0); t0=t1;
 
                     vDSP_vadd(ac->x2, 1, ac->ffn_out, 1, x_cur, 1, (vDSP_Length)(SEQ*DIM));
-                    t1=mach_absolute_time(); t_elem+=tb_ms(t1-t0);
+                    t1=mach_absolute_time(); t_resid+=tb_ms(t1-t0);
                 }
 
                 // Final RMSNorm (CPU)
@@ -492,7 +495,7 @@ int main(int argc, char *argv[]) {
                 // Cross-entropy loss
                 float loss = cross_entropy_loss(dlogits, logits, target_tokens, VOCAB, SEQ);
                 last_loss = loss;
-                t1=mach_absolute_time(); t_elem+=tb_ms(t1-t0); t0=t1;
+                t1=mach_absolute_time(); t_xent+=tb_ms(t1-t0); t0=t1;
 
                 // ===== BACKWARD =====
                 // dlogits already computed by cross_entropy_loss
@@ -517,10 +520,12 @@ int main(int argc, char *argv[]) {
                 });
 
                 // Final RMSNorm backward
+                t0=mach_absolute_time();
                 float *dx_rms_final = (float*)calloc(SEQ*DIM, 4);
                 rmsnorm_bwd(dx_rms_final, grms_final, dy, x_cur, rms_final, DIM, SEQ);
                 memcpy(dy, dx_rms_final, SEQ*DIM*4);
                 free(dx_rms_final);
+                t1=mach_absolute_time(); t_rms_bwd+=tb_ms(t1-t0);
 
                 // ===== BACKWARD (12 layers, reverse) =====
                 for (int L=NLAYERS-1; L>=0; L--) {
@@ -529,7 +534,9 @@ int main(int argc, char *argv[]) {
 
                     // dy is the gradient at the output of this layer
                     // dffn = dy (residual connection: d(x2 + ffn) = dy for both)
+                    t0=mach_absolute_time();
                     memcpy(dffn, dy, SEQ*DIM*4);
+                    t1=mach_absolute_time(); t_memcpy+=tb_ms(t1-t0);
 
                     // FFN backward (ANE)
                     io_write_fp16_at(kern[L].ffnBwd->ioIn, 0, dffn, DIM, SEQ);
@@ -540,11 +547,13 @@ int main(int argc, char *argv[]) {
                     io_read_fp16(kern[L].ffnBwd->ioOut, dh3,    DIM+HIDDEN,  HIDDEN, SEQ);
 
                     // dW FFN async
+                    t0=mach_absolute_time();
                     float *capt_dffn = (float*)malloc(SEQ*DIM*4); memcpy(capt_dffn, dffn, SEQ*DIM*4);
                     float *capt_silu = (float*)malloc(SEQ*HIDDEN*4); memcpy(capt_silu, ac->silu_out, SEQ*HIDDEN*4);
                     float *capt_dh1 = (float*)malloc(SEQ*HIDDEN*4); memcpy(capt_dh1, dh1, SEQ*HIDDEN*4);
                     float *capt_dh3 = (float*)malloc(SEQ*HIDDEN*4); memcpy(capt_dh3, dh3, SEQ*HIDDEN*4);
                     float *capt_x2n = (float*)malloc(SEQ*DIM*4); memcpy(capt_x2n, ac->x2norm, SEQ*DIM*4);
+                    t1=mach_absolute_time(); t_memcpy+=tb_ms(t1-t0);
                     dispatch_group_async(dw_grp, dw_q, ^{
                         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, DIM, HIDDEN, SEQ,
                                     1.0f, capt_dffn, SEQ, capt_silu, SEQ, 1.0f, gr->W2, HIDDEN);
@@ -556,15 +565,20 @@ int main(int argc, char *argv[]) {
                     });
 
                     // RMSNorm2 backward
+                    t0=mach_absolute_time();
                     memset(dx2, 0, SEQ*DIM*4);
                     rmsnorm_bwd(dx2, gr->rms_ffn, dx_ffn, ac->x2, lw[L].rms_ffn, DIM, SEQ);
+                    t1=mach_absolute_time(); t_rms_bwd+=tb_ms(t1-t0); t0=t1;
                     // Add residual: dx2 += dy (from skip connection)
                     for(int i=0;i<SEQ*DIM;i++) dx2[i] += dy[i];
+                    t1=mach_absolute_time(); t_resid+=tb_ms(t1-t0);
 
                     // dWo async
+                    t0=mach_absolute_time();
                     memcpy(do_out_buf, dx2, SEQ*DIM*4);
                     float *capt_do = (float*)malloc(SEQ*DIM*4); memcpy(capt_do, do_out_buf, SEQ*DIM*4);
                     float *capt_attn = (float*)malloc(SEQ*DIM*4); memcpy(capt_attn, ac->attn_out, SEQ*DIM*4);
+                    t1=mach_absolute_time(); t_memcpy+=tb_ms(t1-t0);
                     dispatch_group_async(dw_grp, dw_q, ^{
                         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, DIM, DIM, SEQ,
                                     1.0f, capt_do, SEQ, capt_attn, SEQ, 1.0f, gr->Wo, DIM);
@@ -584,10 +598,12 @@ int main(int argc, char *argv[]) {
                     io_read_fp16(kern[L].sdpaBwd1->ioOut, dv, 0, DIM, SEQ);
 
                     // dWq/dWk/dWv async
+                    t0=mach_absolute_time();
                     float *capt_dq = (float*)malloc(SEQ*DIM*4); memcpy(capt_dq, dq, SEQ*DIM*4);
                     float *capt_dk = (float*)malloc(SEQ*DIM*4); memcpy(capt_dk, dk, SEQ*DIM*4);
                     float *capt_dv = (float*)malloc(SEQ*DIM*4); memcpy(capt_dv, dv, SEQ*DIM*4);
                     float *capt_xn = (float*)malloc(SEQ*DIM*4); memcpy(capt_xn, ac->xnorm, SEQ*DIM*4);
+                    t1=mach_absolute_time(); t_memcpy+=tb_ms(t1-t0);
                     dispatch_group_async(dw_grp, dw_q, ^{
                         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, DIM, DIM, SEQ,
                                     1.0f, capt_dq, SEQ, capt_xn, SEQ, 1.0f, gr->Wq, DIM);
@@ -605,8 +621,10 @@ int main(int argc, char *argv[]) {
                     io_read_fp16(kern[L].qkvBwd->ioOut, dx_attn, 0, DIM, SEQ);
 
                     // RMSNorm1 backward (using saved layer input)
+                    t0=mach_absolute_time();
                     float *dx_rms1 = (float*)calloc(SEQ*DIM, 4);
                     rmsnorm_bwd(dx_rms1, gr->rms_att, dx_attn, ac->layer_in, lw[L].rms_att, DIM, SEQ);
+                    t1=mach_absolute_time(); t_rms_bwd+=tb_ms(t1-t0);
 
                     // dy for next layer (going backward) = dx_rms1 + dx2 residual
                     // Actually: layer output = layer_input + o_out, and x2 = layer_input + o_out
@@ -635,13 +653,17 @@ int main(int argc, char *argv[]) {
                     //   dy_prev_layer = dx_rms1 + dx2  (skip connection input → x2)
                     //
                     // So: dy for previous layer = dx_rms1 + dx2
+                    t0=mach_absolute_time();
                     for(int i=0;i<SEQ*DIM;i++) dy[i] = dx_rms1[i] + dx2[i];
+                    t1=mach_absolute_time(); t_resid+=tb_ms(t1-t0);
                     free(dx_rms1);
                 }
 
                 // Embedding backward
+                t0=mach_absolute_time();
                 dispatch_group_wait(dw_grp, DISPATCH_TIME_FOREVER);
                 embed_backward(gembed, dy, input_tokens, DIM, SEQ);
+                t1=mach_absolute_time(); t_embed_bwd+=tb_ms(t1-t0);
 
                 steps_batch++;
                 if (step % 10 == 0 || step == start_step)
@@ -684,9 +706,14 @@ int main(int argc, char *argv[]) {
 
             printf("  [batch %d: compile=%.0fms train=%.1fms (%.1fms/step) compiles=%d]\n",
                    steps_batch, cms, tms, tms/steps_batch, g_compile_count);
-            printf("    ane=%.1f io=%.1f cls=%.1f elem=%.1f rms=%.1f cblas_wait=%.1f ms/step\n",
-                   t_ane/steps_batch, t_io/steps_batch, t_cls/steps_batch, t_elem/steps_batch,
+            double t_elem_total = t_embed+t_resid+t_xent+t_memcpy+t_rms_bwd+t_embed_bwd;
+            printf("    ane=%.1f io=%.1f cls=%.1f rms_fwd=%.1f cblas_wait=%.1f ms/step\n",
+                   t_ane/steps_batch, t_io/steps_batch, t_cls/steps_batch,
                    t_rms/steps_batch, t_cblas_wait/steps_batch);
+            printf("    elem=%.1f [xent=%.1f memcpy=%.1f rms_bwd=%.1f resid=%.1f embed=%.1f embed_bwd=%.1f]\n",
+                   t_elem_total/steps_batch, t_xent/steps_batch, t_memcpy/steps_batch,
+                   t_rms_bwd/steps_batch, t_resid/steps_batch, t_embed/steps_batch,
+                   t_embed_bwd/steps_batch);
         }
 
         // Efficiency report
