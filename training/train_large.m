@@ -448,34 +448,28 @@ int main(int argc, char *argv[]) {
                     t0=mach_absolute_time();
                     memcpy(ac->layer_in, x_cur, SEQ*DIM*4);
                     t1=mach_absolute_time(); t_memcpy+=tb_ms(t1-t0);
-                    // Attention forward: x_cur → o_out,Q,K,V,attn_out,xnorm
+                    // Attention forward: x_cur → x2,Q,K,V,attn_out,xnorm (residual fused on ANE)
                     t0=mach_absolute_time();
                     io_write_fp16(kern[L].fwdAttn->ioIn, x_cur, DIM, SEQ);
                     t1=mach_absolute_time(); t_io+=tb_ms(t1-t0); t0=t1;
                     ane_eval(kern[L].fwdAttn);
                     t1=mach_absolute_time(); t_ane+=tb_ms(t1-t0); t0=t1;
-                    io_read_fp16(kern[L].fwdAttn->ioOut, ac->o_out,    0,     DIM, SEQ);
+                    io_copy(kern[L].fwdFFN->ioIn, 0, kern[L].fwdAttn->ioOut, 0, DIM, SEQ);
+                    io_read_fp16(kern[L].fwdAttn->ioOut, ac->x2,       0,     DIM, SEQ);
                     io_read_fp16(kern[L].fwdAttn->ioOut, ac->attn_out, 4*DIM, DIM, SEQ);
                     io_read_fp16(kern[L].fwdAttn->ioOut, ac->xnorm,    5*DIM, DIM, SEQ);
                     t1=mach_absolute_time(); t_io+=tb_ms(t1-t0); t0=t1;
 
-                    vDSP_vadd(x_cur, 1, ac->o_out, 1, ac->x2, 1, (vDSP_Length)(SEQ*DIM));
-                    t1=mach_absolute_time(); t_resid+=tb_ms(t1-t0); t0=t1;
-
-                    // FFN forward
-                    io_write_fp16(kern[L].fwdFFN->ioIn, ac->x2, DIM, SEQ);
+                    // FFN forward (x2 already piped via io_copy)
                     t1=mach_absolute_time(); t_io+=tb_ms(t1-t0); t0=t1;
                     ane_eval(kern[L].fwdFFN);
                     t1=mach_absolute_time(); t_ane+=tb_ms(t1-t0); t0=t1;
-                    io_read_fp16(kern[L].fwdFFN->ioOut, ac->ffn_out,  0,              DIM,    SEQ);
+                    io_read_fp16(kern[L].fwdFFN->ioOut, x_cur,        0,              DIM,    SEQ);
                     io_read_fp16(kern[L].fwdFFN->ioOut, ac->h1,       DIM,            HIDDEN, SEQ);
                     io_read_fp16(kern[L].fwdFFN->ioOut, ac->h3,       DIM+HIDDEN,     HIDDEN, SEQ);
                     io_read_fp16(kern[L].fwdFFN->ioOut, ac->silu_out, DIM+2*HIDDEN,   HIDDEN, SEQ);
                     io_read_fp16(kern[L].fwdFFN->ioOut, ac->x2norm,   DIM+3*HIDDEN,   DIM,    SEQ);
-                    t1=mach_absolute_time(); t_io+=tb_ms(t1-t0); t0=t1;
-
-                    vDSP_vadd(ac->x2, 1, ac->ffn_out, 1, x_cur, 1, (vDSP_Length)(SEQ*DIM));
-                    t1=mach_absolute_time(); t_resid+=tb_ms(t1-t0);
+                    t1=mach_absolute_time(); t_io+=tb_ms(t1-t0);
                 }
 
                 // Final RMSNorm (CPU)

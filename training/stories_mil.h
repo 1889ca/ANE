@@ -14,7 +14,7 @@
     "        tensor<int32, [2]> dl = const()[name=string(\"dl\"), val=tensor<int32, [2]>([1,1])];\n" \
     "        int32 gr = const()[name=string(\"gr\"), val=int32(1)];\n"
 
-// SDPA forward + taps: x_in → rmsnorm → QKV+SDPA+Wo → concat(o_out, Q, K, V, attn_out, xnorm)
+// SDPA forward + taps: x_in → rmsnorm → QKV+SDPA+Wo+resid → concat(x2, Q, K, V, attn_out, xnorm)
 static NSString *gen_sdpa_fwd_taps(void) {
     float sc = 1.0f/sqrtf((float)HD);
     float invd = 1.0f/(float)DIM;
@@ -64,14 +64,15 @@ static NSString *gen_sdpa_fwd_taps(void) {
     [m appendFormat:@"        tensor<int32, [4]> os = const()[name=string(\"os\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", DIM,SEQ];
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> af = reshape(shape=os,x=at)[name=string(\"ra\")];\n", DIM,SEQ];
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> oo = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wo,x=af)[name=string(\"co\")];\n", DIM,SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> x2 = add(x=x,y=oo)[name=string(\"res\")];\n", DIM,SEQ];
     [m appendString:@"        int32 cax = const()[name=string(\"cax\"), val=int32(1)];\n"];
     [m appendString:@"        bool cid = const()[name=string(\"cid\"), val=bool(false)];\n"];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> out = concat(axis=cax,interleave=cid,values=(oo,qf,kf,vf,af,xn))[name=string(\"cat\")];\n", 6*DIM,SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> out = concat(axis=cax,interleave=cid,values=(x2,qf,kf,vf,af,xn))[name=string(\"cat\")];\n", 6*DIM,SEQ];
     [m appendString:@"    } -> (out);\n}\n"];
     return m;
 }
 
-// FFN forward + taps: x2 → rmsnorm → FFN → concat(ffn_out, h1, h3, silu_out, x2norm)
+// FFN forward + taps: x2 → rmsnorm → FFN+resid → concat(x_next, h1, h3, silu_out, x2norm)
 static NSString *gen_ffn_fwd_taps(void) {
     float invd = 1.0f/(float)DIM;
     NSMutableString *m = [NSMutableString string];
@@ -100,9 +101,10 @@ static NSString *gen_ffn_fwd_taps(void) {
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> silu = mul(x=h1,y=sig)[name=string(\"si\")];\n", HIDDEN,SEQ];
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> gate = mul(x=silu,y=h3)[name=string(\"gt\")];\n", HIDDEN,SEQ];
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> y = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=W2,x=gate)[name=string(\"c2\")];\n", DIM,SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> xnext = add(x=x,y=y)[name=string(\"res\")];\n", DIM,SEQ];
     [m appendString:@"        int32 cax = const()[name=string(\"cax\"), val=int32(1)];\n"];
     [m appendString:@"        bool cid = const()[name=string(\"cid\"), val=bool(false)];\n"];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> out = concat(axis=cax,interleave=cid,values=(y,h1,h3,gate,xn))[name=string(\"cat\")];\n", 2*DIM+3*HIDDEN,SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> out = concat(axis=cax,interleave=cid,values=(xnext,h1,h3,gate,xn))[name=string(\"cat\")];\n", 2*DIM+3*HIDDEN,SEQ];
     [m appendString:@"    } -> (out);\n}\n"];
     return m;
 }

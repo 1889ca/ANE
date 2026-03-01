@@ -71,12 +71,10 @@ typedef struct {
     float *xnorm;      // [DIM, SEQ] rmsnorm1 output
     float *Q, *K, *V;  // [DIM, SEQ] QKV projections
     float *attn_out;    // [DIM, SEQ] attention output (before Wo)
-    float *o_out;       // [DIM, SEQ] Wo output
-    float *x2;          // [DIM, SEQ] residual after attn
+    float *x2;          // [DIM, SEQ] residual after attn (fused on ANE)
     float *x2norm;      // [DIM, SEQ] rmsnorm2 output
     float *h1, *h3;     // [HIDDEN, SEQ] FFN intermediates
     float *silu_out;    // [HIDDEN, SEQ] SiLU(h1)*h3
-    float *ffn_out;     // [DIM, SEQ] FFN output
 } LayerActs;
 
 // Per-layer gradient accumulators
@@ -158,16 +156,16 @@ static LayerActs layer_acts_alloc(void) {
     a.layer_in=(float*)malloc(SEQ*DIM*4);
     a.xnorm=(float*)malloc(SEQ*DIM*4); a.Q=(float*)malloc(SEQ*DIM*4);
     a.K=(float*)malloc(SEQ*DIM*4); a.V=(float*)malloc(SEQ*DIM*4);
-    a.attn_out=(float*)malloc(SEQ*DIM*4); a.o_out=(float*)malloc(SEQ*DIM*4);
+    a.attn_out=(float*)malloc(SEQ*DIM*4);
     a.x2=(float*)malloc(SEQ*DIM*4); a.x2norm=(float*)malloc(SEQ*DIM*4);
     a.h1=(float*)malloc(SEQ*HIDDEN*4); a.h3=(float*)malloc(SEQ*HIDDEN*4);
-    a.silu_out=(float*)malloc(SEQ*HIDDEN*4); a.ffn_out=(float*)malloc(SEQ*DIM*4);
+    a.silu_out=(float*)malloc(SEQ*HIDDEN*4);
     return a;
 }
 static void layer_acts_free(LayerActs *a) {
     free(a->layer_in);free(a->xnorm);free(a->Q);free(a->K);free(a->V);
-    free(a->attn_out);free(a->o_out);free(a->x2);free(a->x2norm);
-    free(a->h1);free(a->h3);free(a->silu_out);free(a->ffn_out);
+    free(a->attn_out);free(a->x2);free(a->x2norm);
+    free(a->h1);free(a->h3);free(a->silu_out);
 }
 static LayerGrads layer_grads_alloc(void) {
     LayerGrads g;
