@@ -1,6 +1,6 @@
 // train_large.m — Train stories110M (12 layers, 768dim, 3072hidden) on ANE
 // Uses pretokenized TinyStories data with cross-entropy loss
-// 5 weight-bearing ANE kernels per layer × 12 layers = 60 per compile batch
+// 5 weight-bearing ANE kernels per layer × 12 layers + 2 classifier = 62 per compile batch
 #include "stories_io.h"
 #include "stories_mil.h"
 #include "stories_cpu_ops.h"
@@ -109,6 +109,7 @@ static void free_layer_kernels(LayerKernels *lk) {
 // ===== Checkpoint save/load =====
 static void save_checkpoint(const char *path, int step, int total_steps, float lr, float loss,
                             double cc, double ct, double cw, int cs, int cb, int adam_t,
+                            int accum_steps,
                             LayerWeights *lw, LayerAdam *la, float *rms_final, AdamState *arms_final,
                             float *embed, AdamState *aembed) {
     FILE *f = fopen(path, "wb");
@@ -120,6 +121,7 @@ static void save_checkpoint(const char *path, int step, int total_steps, float l
     h.lr = lr; h.loss = loss;
     h.cum_compile = cc; h.cum_train = ct; h.cum_wall = cw;
     h.cum_steps = cs; h.cum_batches = cb; h.adam_t = adam_t;
+    h.pad[0] = accum_steps;
     fwrite(&h, sizeof(h), 1, f);
     // Per-layer weights + adam
     for (int L = 0; L < NLAYERS; L++) {
@@ -147,6 +149,7 @@ static void save_checkpoint(const char *path, int step, int total_steps, float l
 
 static bool load_checkpoint(const char *path, int *step, int *total_steps, float *lr, float *loss,
                              double *cc, double *ct, double *cw, int *cs, int *cb, int *adam_t,
+                             int *accum_steps,
                              LayerWeights *lw, LayerAdam *la, float *rms_final, AdamState *arms_final,
                              float *embed, AdamState *aembed) {
     FILE *f = fopen(path, "rb");
@@ -157,6 +160,7 @@ static bool load_checkpoint(const char *path, int *step, int *total_steps, float
     *step = h.step; *total_steps = h.total_steps; *lr = h.lr; *loss = h.loss;
     *cc = h.cum_compile; *ct = h.cum_train; *cw = h.cum_wall;
     *cs = h.cum_steps; *cb = h.cum_batches; *adam_t = h.adam_t;
+    if (h.pad[0] > 0) *accum_steps = h.pad[0];
     for (int L = 0; L < NLAYERS; L++) {
         fread(lw[L].Wq,4,WQ_SZ,f); fread(lw[L].Wk,4,WQ_SZ,f);
         fread(lw[L].Wv,4,WQ_SZ,f); fread(lw[L].Wo,4,WO_SZ,f);
@@ -191,6 +195,8 @@ int main(int argc, char *argv[]) {
         float lr = 3e-4f;
         float adam_b1=0.9f, adam_b2=0.999f, adam_eps=1e-8f;
         int adam_t = 0, start_step = 0;
+        int accum_steps = DEFAULT_ACCUM_STEPS;
+        int max_compiles = DEFAULT_MAX_COMPILES;
 
         // Parse args
         bool do_resume = false;
@@ -198,6 +204,8 @@ int main(int argc, char *argv[]) {
             if (strcmp(argv[i], "--resume") == 0) do_resume = true;
             else if (strcmp(argv[i], "--steps") == 0 && i+1<argc) total_steps = atoi(argv[++i]);
             else if (strcmp(argv[i], "--lr") == 0 && i+1<argc) lr = atof(argv[++i]);
+            else if (strcmp(argv[i], "--accum") == 0 && i+1<argc) accum_steps = atoi(argv[++i]);
+            else if (strcmp(argv[i], "--max-compiles") == 0 && i+1<argc) max_compiles = atoi(argv[++i]);
         }
 
         // Allocate per-layer state
@@ -230,6 +238,7 @@ int main(int argc, char *argv[]) {
         if (do_resume) {
             resuming = load_checkpoint(CKPT_PATH, &start_step, &total_steps, &lr, &resume_loss,
                 &cum_compile, &cum_train, &cum_wall, &cum_steps, &cum_batches, &adam_t,
+                &accum_steps,
                 lw, la, rms_final, &arms_final, embed, &aembed);
             if (resuming) printf("[RESUMED step %d, loss=%.4f]\n", start_step, resume_loss);
         }
@@ -258,7 +267,7 @@ int main(int argc, char *argv[]) {
             printf("Params: %.2fM (transformer %.2fM + embed %.2fM)\n", tp/1e6, xfmr_params/1e6, embed_params/1e6);
             printf("Kernels: %d (%d weight-bearing + %d static sdpaBwd2)\n",
                    TOTAL_WEIGHT_KERNELS+NLAYERS, TOTAL_WEIGHT_KERNELS, NLAYERS);
-            printf("Accum %d steps per recompile | Adam LR=%.1e b1=%.1f b2=%.3f\n", ACCUM_STEPS, lr, adam_b1, adam_b2);
+            printf("Accum %d steps per recompile | Adam LR=%.1e b1=%.1f b2=%.3f\n", accum_steps, lr, adam_b1, adam_b2);
             double fwd_f = NLAYERS*(4.0*2*DIM*DIM*SEQ + 2.0*2*DIM*HIDDEN*SEQ + 2.0*HIDDEN*DIM*SEQ);
             double bwd_dx_f = fwd_f, bwd_dw_f = fwd_f;
             double sdpa_f = NLAYERS*2.0*HEADS*5*SEQ*SEQ*HD;
@@ -267,7 +276,7 @@ int main(int argc, char *argv[]) {
             double ane_f = fwd_f + bwd_dx_f + sdpa_f;
             printf("FLOPs/step: fwd=%.0fM bwd_dx=%.0fM bwd_dW=%.0fM sdpa_bwd=%.0fM total=%.0fM\n",
                    fwd_f/1e6, bwd_dx_f/1e6, bwd_dw_f/1e6, sdpa_f/1e6, total_f/1e6);
-            printf("ANE FLOPs/step: %.0fM (fwd+bwd_dx+sdpa_bwd) | CPU: dW+cls (cblas)\n\n", ane_f/1e6);
+            printf("ANE FLOPs/step: %.0fM (fwd+bwd_dx+sdpa_bwd+cls) | CPU: dW (cblas)\n\n", ane_f/1e6);
         }
 
         // mmap token data
@@ -306,6 +315,10 @@ int main(int argc, char *argv[]) {
             if (!sdpaBwd2[L]) { printf("sdpaBwd2 compile failed\n"); return 1; }
         }
 
+        // Classifier ANE kernels (not per-layer, recompiled each batch with embed weights)
+        Kern *cls_fwd = NULL, *cls_bwd = NULL;
+        bool use_ane_cls = true;
+
         dispatch_queue_t dw_q = dispatch_queue_create("dw_cblas", DISPATCH_QUEUE_SERIAL);
         dispatch_group_t dw_grp = dispatch_group_create();
 
@@ -319,33 +332,54 @@ int main(int argc, char *argv[]) {
         int step = start_step;
         while (step < total_steps) {
             // Check compile budget
-            if (g_compile_count + TOTAL_WEIGHT_KERNELS > MAX_COMPILES) {
+            if (g_compile_count + TOTAL_WEIGHT_KERNELS + (use_ane_cls ? CLS_KERNELS : 0) > max_compiles) {
                 for (int L=0; L<NLAYERS; L++) { free_layer_kernels(&kern[L]); free_kern(sdpaBwd2[L]); }
+                free_kern(cls_fwd); free_kern(cls_bwd); cls_fwd = cls_bwd = NULL;
                 double wall = tb_ms(mach_absolute_time() - t_wall_start);
                 save_checkpoint(CKPT_PATH, step, total_steps, lr, last_loss,
                     total_compile_ms+cum_compile, total_train_ms+cum_train, wall+cum_wall,
                     total_steps_done+cum_steps, total_batches+cum_batches, adam_t,
+                    accum_steps,
                     lw, la, rms_final, &arms_final, embed, &aembed);
                 printf("[exec() restart step %d, %d compiles, loss=%.4f]\n", step, g_compile_count, last_loss);
                 fflush(stdout);
-                execl(argv[0], argv[0], "--resume", NULL);
-                perror("execl"); return 1;
+                // Build new argv: original args + --resume (deduped)
+                char **new_argv = (char**)calloc(argc + 3, sizeof(char*));
+                int n = 0;
+                new_argv[n++] = argv[0];
+                bool has_resume = false;
+                for (int i = 1; i < argc; i++) {
+                    if (strcmp(argv[i], "--resume") == 0) { has_resume = true; }
+                    new_argv[n++] = argv[i];
+                }
+                if (!has_resume) new_argv[n++] = "--resume";
+                new_argv[n] = NULL;
+                execv(argv[0], new_argv);
+                perror("execv"); free(new_argv); return 1;
             }
 
             // Compile all layers' weight-bearing kernels
             uint64_t tc = mach_absolute_time();
             for (int L=0; L<NLAYERS; L++) free_layer_kernels(&kern[L]);
 
-            bool compile_ok = true;
+            __block bool compile_ok = true;
+            dispatch_queue_t cq = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+            dispatch_semaphore_t csem = dispatch_semaphore_create(4);
+            dispatch_group_t cgrp = dispatch_group_create();
+            LayerKernels *kern_p = kern;
+            LayerWeights *lw_p = lw;
             for (int L=0; L<NLAYERS; L++) {
-                printf("  Compiling layer %d/%d... (%d compiles)\r", L+1, NLAYERS, g_compile_count);
-                fflush(stdout);
-                if (!compile_layer_kernels(&kern[L], &lw[L])) {
-                    printf("\nCompile failed at layer %d, restart\n", L);
-                    compile_ok = false; break;
-                }
+                dispatch_group_async(cgrp, cq, ^{
+                    dispatch_semaphore_wait(csem, DISPATCH_TIME_FOREVER);
+                    if (compile_ok && !compile_layer_kernels(&kern_p[L], &lw_p[L])) {
+                        printf("\nCompile failed at layer %d, restart\n", L);
+                        compile_ok = false;
+                    }
+                    dispatch_semaphore_signal(csem);
+                });
             }
-            if (!compile_ok) { g_compile_count = MAX_COMPILES; continue; }
+            dispatch_group_wait(cgrp, DISPATCH_TIME_FOREVER);
+            if (!compile_ok) { g_compile_count = max_compiles; continue; }
 
             // Re-compile sdpaBwd2 if needed (after exec restart)
             for (int L=0; L<NLAYERS; L++) {
@@ -355,9 +389,27 @@ int main(int argc, char *argv[]) {
                 }
             }
 
+            // Compile classifier ANE kernels (embed weights change each batch)
+            if (use_ane_cls) {
+                free_kern(cls_fwd); free_kern(cls_bwd);
+                cls_fwd = compile_kern_mil_w(gen_cls_fwd(), (@{
+                    @"@model_path/weights/embed.bin": @{@"offset":@0, @"data":build_blob(embed, VOCAB, DIM)},
+                }), DIM*SEQ*2, VOCAB*SEQ*2);
+                cls_bwd = compile_kern_mil_w(gen_cls_bwd(), (@{
+                    @"@model_path/weights/embed_t.bin": @{@"offset":@0, @"data":build_blob_t(embed, VOCAB, DIM)},
+                }), VOCAB*SEQ*2, DIM*SEQ*2);
+                if (!cls_fwd || !cls_bwd) {
+                    printf("  [cls] ANE compile failed (VOCAB=%d may exceed channel limit), falling back to CPU\n", VOCAB);
+                    free_kern(cls_fwd); free_kern(cls_bwd);
+                    cls_fwd = cls_bwd = NULL;
+                    use_ane_cls = false;
+                }
+            }
+
+            int n_compiled = TOTAL_WEIGHT_KERNELS + (use_ane_cls ? CLS_KERNELS : 0);
             double cms = tb_ms(mach_absolute_time() - tc);
             total_compile_ms += cms;
-            printf("  Compiled %d kernels in %.0fms                    \n", TOTAL_WEIGHT_KERNELS, cms);
+            printf("  Compiled %d kernels in %.0fms%s\n", n_compiled, cms, use_ane_cls ? " (cls=ANE)" : " (cls=CPU)");
 
             // Zero gradient accumulators
             for (int L=0; L<NLAYERS; L++) layer_grads_zero(&grads[L]);
@@ -368,7 +420,7 @@ int main(int argc, char *argv[]) {
             uint64_t tt = mach_absolute_time();
             double t_ane=0,t_io=0,t_elem=0,t_rms=0,t_cblas_wait=0,t_cls=0;
 
-            for (int a=0; a<ACCUM_STEPS && step<total_steps; a++, step++) {
+            for (int a=0; a<accum_steps && step<total_steps; a++, step++) {
                 uint64_t t0,t1;
                 // Sample random position in token data
                 size_t max_pos = n_tokens - SEQ - 1;
@@ -424,10 +476,17 @@ int main(int argc, char *argv[]) {
                 rmsnorm(x_final, x_cur, rms_final, DIM, SEQ);
                 t1=mach_absolute_time(); t_rms+=tb_ms(t1-t0); t0=t1;
 
-                // Classifier: logits = embed^T @ x_final
-                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                            VOCAB, SEQ, DIM, 1.0f,
-                            embed, DIM, x_final, SEQ, 0.0f, logits, SEQ);
+                // Classifier: logits = embed @ x_final
+                if (use_ane_cls) {
+                    dispatch_group_wait(dw_grp, DISPATCH_TIME_FOREVER);
+                    io_write_fp16(cls_fwd->ioIn, x_final, DIM, SEQ);
+                    ane_eval(cls_fwd);
+                    io_read_fp16(cls_fwd->ioOut, logits, 0, VOCAB, SEQ);
+                } else {
+                    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                                VOCAB, SEQ, DIM, 1.0f,
+                                embed, DIM, x_final, SEQ, 0.0f, logits, SEQ);
+                }
                 t1=mach_absolute_time(); t_cls+=tb_ms(t1-t0); t0=t1;
 
                 // Cross-entropy loss
@@ -440,9 +499,15 @@ int main(int argc, char *argv[]) {
 
                 // Classifier backward: dx_final = embed^T @ dlogits, dembed += dlogits @ x_final^T
                 // dx_final[DIM,SEQ] = embed^T[DIM,VOCAB] @ dlogits[VOCAB,SEQ]
-                cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
-                            DIM, SEQ, VOCAB, 1.0f,
-                            embed, DIM, dlogits, SEQ, 0.0f, dy, SEQ);
+                if (use_ane_cls) {
+                    io_write_fp16(cls_bwd->ioIn, dlogits, VOCAB, SEQ);
+                    ane_eval(cls_bwd);
+                    io_read_fp16(cls_bwd->ioOut, dy, 0, DIM, SEQ);
+                } else {
+                    cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                                DIM, SEQ, VOCAB, 1.0f,
+                                embed, DIM, dlogits, SEQ, 0.0f, dy, SEQ);
+                }
 
                 // dembed[VOCAB,DIM] += dlogits[VOCAB,SEQ] @ x_final^T[SEQ,DIM]
                 dispatch_group_async(dw_grp, dw_q, ^{
@@ -632,7 +697,8 @@ int main(int argc, char *argv[]) {
         double sdpa_flops = NLAYERS * 2.0*HEADS*5*SEQ*SEQ*HD;
         double cls_flops = 2.0*VOCAB*DIM*SEQ;
         double total_flops = (fwd_flops*3 + sdpa_flops + cls_flops*3) * total_steps_done;
-        double ane_flops = (fwd_flops*2 + sdpa_flops) * total_steps_done;
+        double ane_cls_flops = use_ane_cls ? cls_flops*2 : 0;  // fwd + bwd_dx on ANE
+        double ane_flops = (fwd_flops*2 + sdpa_flops + ane_cls_flops) * total_steps_done;
         printf("\n=== Efficiency Report ===\n");
         printf("Total steps:     %d\n", total_steps_done);
         printf("Wall time:       %.0f ms (%.1f s)\n", wall, wall/1000);
@@ -644,6 +710,7 @@ int main(int argc, char *argv[]) {
         printf("ANE utilization: %.1f%% of 15.8 TFLOPS\n", 100*ane_flops/(total_train_ms*1e9)/15.8);
 
         // Cleanup
+        free_kern(cls_fwd); free_kern(cls_bwd);
         for (int L=0; L<NLAYERS; L++) {
             free_layer_kernels(&kern[L]);
             free_kern(sdpaBwd2[L]);

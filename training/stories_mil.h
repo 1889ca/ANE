@@ -272,6 +272,30 @@ static NSString *gen_sdpa_bwd2(void) {
     return m;
 }
 
+// Classifier forward: x_final → logits via embed conv
+static NSString *gen_cls_fwd(void) {
+    NSMutableString *m = [NSMutableString string];
+    [m appendString:MIL_HDR];
+    [m appendFormat:@"    func main<ios18>(tensor<fp16, [1, %d, 1, %d]> x) {\n", DIM, SEQ];
+    [m appendString:@CONV_CONST];
+    [m appendFormat:@"        tensor<fp16, [%d,%d,1,1]> We = const()[name=string(\"We\"), val=tensor<fp16, [%d,%d,1,1]>(BLOBFILE(path=string(\"@model_path/weights/embed.bin\"), offset=uint64(64)))];\n", VOCAB,DIM,VOCAB,DIM];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> out = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=We,x=x)[name=string(\"cls\")];\n", VOCAB,SEQ];
+    [m appendString:@"    } -> (out);\n}\n"];
+    return m;
+}
+
+// Classifier backward dx: dlogits → dy via transposed embed conv
+static NSString *gen_cls_bwd(void) {
+    NSMutableString *m = [NSMutableString string];
+    [m appendString:MIL_HDR];
+    [m appendFormat:@"    func main<ios18>(tensor<fp16, [1, %d, 1, %d]> x) {\n", VOCAB, SEQ];
+    [m appendString:@CONV_CONST];
+    [m appendFormat:@"        tensor<fp16, [%d,%d,1,1]> Wet = const()[name=string(\"Wet\"), val=tensor<fp16, [%d,%d,1,1]>(BLOBFILE(path=string(\"@model_path/weights/embed_t.bin\"), offset=uint64(64)))];\n", DIM,VOCAB,DIM,VOCAB];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> out = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wet,x=x)[name=string(\"cls_bwd\")];\n", DIM,SEQ];
+    [m appendString:@"    } -> (out);\n}\n"];
+    return m;
+}
+
 // Mask blob (causal mask [SEQ,SEQ])
 static NSData *g_mask_blob = nil;
 static NSData *get_mask_blob(void) {

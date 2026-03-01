@@ -22,8 +22,8 @@
 #define SEQ 256
 #define NLAYERS 12
 #define VOCAB 32000
-#define ACCUM_STEPS 10
-#define MAX_COMPILES 100
+#define DEFAULT_ACCUM_STEPS 50
+#define DEFAULT_MAX_COMPILES 200
 
 // Per compile: 5 weight-bearing kernels per layer + 1 classifier = 5*12+1 = 61
 // Plus 1 static (sdpaBwd2 per layer, no weights) = 12 more but those are weight-free
@@ -33,6 +33,7 @@
 // With MAX_COMPILES=100, we get 1 batch of ACCUM_STEPS before restart
 #define KERNELS_PER_LAYER 5
 #define TOTAL_WEIGHT_KERNELS (KERNELS_PER_LAYER * NLAYERS)
+#define CLS_KERNELS 2
 
 // Attention score channels for SDPA backward
 #define SCORE_CH (HEADS*SEQ)
