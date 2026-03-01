@@ -68,14 +68,29 @@ typedef struct {
 // Per-layer activation buffers (saved for backward)
 typedef struct {
     float *layer_in;    // [DIM, SEQ] input to this layer (for rmsnorm1 bwd)
-    float *xnorm;      // [DIM, SEQ] rmsnorm1 output
     float *Q, *K, *V;  // [DIM, SEQ] QKV projections
-    float *attn_out;    // [DIM, SEQ] attention output (before Wo)
     float *x2;          // [DIM, SEQ] residual after attn (fused on ANE)
-    float *x2norm;      // [DIM, SEQ] rmsnorm2 output
     float *h1, *h3;     // [HIDDEN, SEQ] FFN intermediates
-    float *silu_out;    // [HIDDEN, SEQ] SiLU(h1)*h3
 } LayerActs;
+
+// Double-buffered dW capture slots (eliminates malloc+memcpy per step)
+typedef struct {
+    // Activations: io_read writes here directly in forward
+    float *silu_out[2];  // [HIDDEN, SEQ]
+    float *x2norm[2];    // [DIM, SEQ]
+    float *attn_out[2];  // [DIM, SEQ]
+    float *xnorm[2];     // [DIM, SEQ]
+    // Gradients: io_read writes here directly in backward
+    float *dh1[2];       // [HIDDEN, SEQ]
+    float *dh3[2];       // [HIDDEN, SEQ]
+    float *dq[2];        // [DIM, SEQ]
+    float *dk[2];        // [DIM, SEQ]
+    float *dv[2];        // [DIM, SEQ]
+    // Gradients: memcpy from main-thread buffers
+    float *dffn[2];      // [DIM, SEQ]
+    float *dx2[2];       // [DIM, SEQ]
+    dispatch_semaphore_t sem;
+} LayerDWCap;
 
 // Per-layer gradient accumulators
 typedef struct {
@@ -154,18 +169,43 @@ static void layer_adam_free(LayerAdam *a) {
 static LayerActs layer_acts_alloc(void) {
     LayerActs a;
     a.layer_in=(float*)malloc(SEQ*DIM*4);
-    a.xnorm=(float*)malloc(SEQ*DIM*4); a.Q=(float*)malloc(SEQ*DIM*4);
+    a.Q=(float*)malloc(SEQ*DIM*4);
     a.K=(float*)malloc(SEQ*DIM*4); a.V=(float*)malloc(SEQ*DIM*4);
-    a.attn_out=(float*)malloc(SEQ*DIM*4);
-    a.x2=(float*)malloc(SEQ*DIM*4); a.x2norm=(float*)malloc(SEQ*DIM*4);
+    a.x2=(float*)malloc(SEQ*DIM*4);
     a.h1=(float*)malloc(SEQ*HIDDEN*4); a.h3=(float*)malloc(SEQ*HIDDEN*4);
-    a.silu_out=(float*)malloc(SEQ*HIDDEN*4);
     return a;
 }
 static void layer_acts_free(LayerActs *a) {
-    free(a->layer_in);free(a->xnorm);free(a->Q);free(a->K);free(a->V);
-    free(a->attn_out);free(a->x2);free(a->x2norm);
-    free(a->h1);free(a->h3);free(a->silu_out);
+    free(a->layer_in);free(a->Q);free(a->K);free(a->V);
+    free(a->x2);
+    free(a->h1);free(a->h3);
+}
+static LayerDWCap layer_dwcap_alloc(void) {
+    LayerDWCap c;
+    for (int s=0; s<2; s++) {
+        c.silu_out[s]=(float*)malloc(SEQ*HIDDEN*4);
+        c.x2norm[s]=(float*)malloc(SEQ*DIM*4);
+        c.attn_out[s]=(float*)malloc(SEQ*DIM*4);
+        c.xnorm[s]=(float*)malloc(SEQ*DIM*4);
+        c.dh1[s]=(float*)malloc(SEQ*HIDDEN*4);
+        c.dh3[s]=(float*)malloc(SEQ*HIDDEN*4);
+        c.dq[s]=(float*)malloc(SEQ*DIM*4);
+        c.dk[s]=(float*)malloc(SEQ*DIM*4);
+        c.dv[s]=(float*)malloc(SEQ*DIM*4);
+        c.dffn[s]=(float*)malloc(SEQ*DIM*4);
+        c.dx2[s]=(float*)malloc(SEQ*DIM*4);
+    }
+    c.sem = dispatch_semaphore_create(2);
+    return c;
+}
+static void layer_dwcap_free(LayerDWCap *c) {
+    for (int s=0; s<2; s++) {
+        free(c->silu_out[s]);free(c->x2norm[s]);
+        free(c->attn_out[s]);free(c->xnorm[s]);
+        free(c->dh1[s]);free(c->dh3[s]);
+        free(c->dq[s]);free(c->dk[s]);free(c->dv[s]);
+        free(c->dffn[s]);free(c->dx2[s]);
+    }
 }
 static LayerGrads layer_grads_alloc(void) {
     LayerGrads g;

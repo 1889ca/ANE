@@ -214,11 +214,13 @@ int main(int argc, char *argv[]) {
         LayerActs acts[NLAYERS];
         LayerGrads grads[NLAYERS];
         LayerKernels kern[NLAYERS];
+        LayerDWCap dwcap[NLAYERS];
         for (int L=0; L<NLAYERS; L++) {
             lw[L] = layer_weights_alloc();
             la[L] = layer_adam_alloc();
             acts[L] = layer_acts_alloc();
             grads[L] = layer_grads_alloc();
+            dwcap[L] = layer_dwcap_alloc();
             memset(&kern[L], 0, sizeof(LayerKernels));
         }
 
@@ -291,15 +293,8 @@ int main(int argc, char *argv[]) {
 
         // Gradient buffers shared across layers (reused each step)
         float *dy = (float*)malloc(SEQ*DIM*4);            // gradient flowing backward
-        float *dffn = (float*)malloc(SEQ*DIM*4);
-        float *dh1 = (float*)malloc(SEQ*HIDDEN*4);
-        float *dh3 = (float*)malloc(SEQ*HIDDEN*4);
         float *dx_ffn = (float*)malloc(SEQ*DIM*4);
         float *dx2 = (float*)malloc(SEQ*DIM*4);
-        float *do_out_buf = (float*)malloc(SEQ*DIM*4);
-        float *dq = (float*)malloc(SEQ*DIM*4);
-        float *dk = (float*)malloc(SEQ*DIM*4);
-        float *dv = (float*)malloc(SEQ*DIM*4);
         float *dx_attn = (float*)malloc(SEQ*DIM*4);
 
         // x buffer for input to each layer (channel-first [DIM, SEQ])
@@ -428,6 +423,7 @@ int main(int argc, char *argv[]) {
             double t_embed=0,t_resid=0,t_xent=0,t_memcpy=0,t_rms_bwd=0,t_embed_bwd=0;
 
             for (int a=0; a<accum_steps && step<total_steps; a++, step++) {
+                int slot = a % 2;
                 uint64_t t0,t1;
                 // Sample random position in token data
                 size_t max_pos = n_tokens - SEQ - 1;
@@ -455,20 +451,20 @@ int main(int argc, char *argv[]) {
                     ane_eval(kern[L].fwdAttn);
                     t1=mach_absolute_time(); t_ane+=tb_ms(t1-t0); t0=t1;
                     io_copy(kern[L].fwdFFN->ioIn, 0, kern[L].fwdAttn->ioOut, 0, DIM, SEQ);
-                    io_read_fp16(kern[L].fwdAttn->ioOut, ac->x2,       0,     DIM, SEQ);
-                    io_read_fp16(kern[L].fwdAttn->ioOut, ac->attn_out, 4*DIM, DIM, SEQ);
-                    io_read_fp16(kern[L].fwdAttn->ioOut, ac->xnorm,    5*DIM, DIM, SEQ);
+                    io_read_fp16(kern[L].fwdAttn->ioOut, ac->x2,                  0,     DIM, SEQ);
+                    io_read_fp16(kern[L].fwdAttn->ioOut, dwcap[L].attn_out[slot], 4*DIM, DIM, SEQ);
+                    io_read_fp16(kern[L].fwdAttn->ioOut, dwcap[L].xnorm[slot],    5*DIM, DIM, SEQ);
                     t1=mach_absolute_time(); t_io+=tb_ms(t1-t0); t0=t1;
 
                     // FFN forward (x2 already piped via io_copy)
                     t1=mach_absolute_time(); t_io+=tb_ms(t1-t0); t0=t1;
                     ane_eval(kern[L].fwdFFN);
                     t1=mach_absolute_time(); t_ane+=tb_ms(t1-t0); t0=t1;
-                    io_read_fp16(kern[L].fwdFFN->ioOut, x_cur,        0,              DIM,    SEQ);
-                    io_read_fp16(kern[L].fwdFFN->ioOut, ac->h1,       DIM,            HIDDEN, SEQ);
-                    io_read_fp16(kern[L].fwdFFN->ioOut, ac->h3,       DIM+HIDDEN,     HIDDEN, SEQ);
-                    io_read_fp16(kern[L].fwdFFN->ioOut, ac->silu_out, DIM+2*HIDDEN,   HIDDEN, SEQ);
-                    io_read_fp16(kern[L].fwdFFN->ioOut, ac->x2norm,   DIM+3*HIDDEN,   DIM,    SEQ);
+                    io_read_fp16(kern[L].fwdFFN->ioOut, x_cur,                   0,            DIM,    SEQ);
+                    io_read_fp16(kern[L].fwdFFN->ioOut, ac->h1,                  DIM,          HIDDEN, SEQ);
+                    io_read_fp16(kern[L].fwdFFN->ioOut, ac->h3,                  DIM+HIDDEN,   HIDDEN, SEQ);
+                    io_read_fp16(kern[L].fwdFFN->ioOut, dwcap[L].silu_out[slot], DIM+2*HIDDEN, HIDDEN, SEQ);
+                    io_read_fp16(kern[L].fwdFFN->ioOut, dwcap[L].x2norm[slot],   DIM+3*HIDDEN, DIM,   SEQ);
                     t1=mach_absolute_time(); t_io+=tb_ms(t1-t0);
                 }
 
@@ -533,37 +529,32 @@ int main(int argc, char *argv[]) {
                 for (int L=NLAYERS-1; L>=0; L--) {
                     LayerActs *ac = &acts[L];
                     LayerGrads *gr = &grads[L];
+                    LayerDWCap *cap = &dwcap[L];
+
+                    // Acquire capture slot (blocks if slot still in use by async dW from 2 steps ago)
+                    dispatch_semaphore_wait(cap->sem, DISPATCH_TIME_FOREVER);
 
                     // dy is the gradient at the output of this layer
-                    // dffn = dy (residual connection: d(x2 + ffn) = dy for both)
                     t0=mach_absolute_time();
-                    memcpy(dffn, dy, SEQ*DIM*4);
+                    memcpy(cap->dffn[slot], dy, SEQ*DIM*4);
                     t1=mach_absolute_time(); t_memcpy+=tb_ms(t1-t0);
 
                     // FFN backward (ANE)
-                    io_write_fp16_at(kern[L].ffnBwd->ioIn, 0, dffn, DIM, SEQ);
+                    io_write_fp16_at(kern[L].ffnBwd->ioIn, 0, cap->dffn[slot], DIM, SEQ);
                     io_copy(kern[L].ffnBwd->ioIn, DIM, kern[L].fwdFFN->ioOut, DIM, 2*HIDDEN, SEQ);
                     ane_eval(kern[L].ffnBwd);
-                    io_read_fp16(kern[L].ffnBwd->ioOut, dx_ffn, 0,           DIM,    SEQ);
-                    io_read_fp16(kern[L].ffnBwd->ioOut, dh1,    DIM,         HIDDEN, SEQ);
-                    io_read_fp16(kern[L].ffnBwd->ioOut, dh3,    DIM+HIDDEN,  HIDDEN, SEQ);
+                    io_read_fp16(kern[L].ffnBwd->ioOut, dx_ffn,         0,          DIM,    SEQ);
+                    io_read_fp16(kern[L].ffnBwd->ioOut, cap->dh1[slot], DIM,        HIDDEN, SEQ);
+                    io_read_fp16(kern[L].ffnBwd->ioOut, cap->dh3[slot], DIM+HIDDEN, HIDDEN, SEQ);
 
-                    // dW FFN async
-                    t0=mach_absolute_time();
-                    float *capt_dffn = (float*)malloc(SEQ*DIM*4); memcpy(capt_dffn, dffn, SEQ*DIM*4);
-                    float *capt_silu = (float*)malloc(SEQ*HIDDEN*4); memcpy(capt_silu, ac->silu_out, SEQ*HIDDEN*4);
-                    float *capt_dh1 = (float*)malloc(SEQ*HIDDEN*4); memcpy(capt_dh1, dh1, SEQ*HIDDEN*4);
-                    float *capt_dh3 = (float*)malloc(SEQ*HIDDEN*4); memcpy(capt_dh3, dh3, SEQ*HIDDEN*4);
-                    float *capt_x2n = (float*)malloc(SEQ*DIM*4); memcpy(capt_x2n, ac->x2norm, SEQ*DIM*4);
-                    t1=mach_absolute_time(); t_memcpy+=tb_ms(t1-t0);
+                    // dW FFN async (silu_out[slot], x2norm[slot] populated in forward)
                     dispatch_group_async(layer_dw_grp, dw_layer_q[L], ^{
                         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, DIM, HIDDEN, SEQ,
-                                    1.0f, capt_dffn, SEQ, capt_silu, SEQ, 1.0f, gr->W2, HIDDEN);
+                                    1.0f, cap->dffn[slot], SEQ, cap->silu_out[slot], SEQ, 1.0f, gr->W2, HIDDEN);
                         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, HIDDEN, DIM, SEQ,
-                                    1.0f, capt_dh1, SEQ, capt_x2n, SEQ, 1.0f, gr->W1, DIM);
+                                    1.0f, cap->dh1[slot], SEQ, cap->x2norm[slot], SEQ, 1.0f, gr->W1, DIM);
                         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, HIDDEN, DIM, SEQ,
-                                    1.0f, capt_dh3, SEQ, capt_x2n, SEQ, 1.0f, gr->W3, DIM);
-                        free(capt_dffn); free(capt_silu); free(capt_dh1); free(capt_dh3); free(capt_x2n);
+                                    1.0f, cap->dh3[slot], SEQ, cap->x2norm[slot], SEQ, 1.0f, gr->W3, DIM);
                     });
 
                     // RMSNorm2 backward
@@ -575,16 +566,13 @@ int main(int argc, char *argv[]) {
                     for(int i=0;i<SEQ*DIM;i++) dx2[i] += dy[i];
                     t1=mach_absolute_time(); t_resid+=tb_ms(t1-t0);
 
-                    // dWo async
+                    // dWo async (attn_out[slot] populated in forward)
                     t0=mach_absolute_time();
-                    memcpy(do_out_buf, dx2, SEQ*DIM*4);
-                    float *capt_do = (float*)malloc(SEQ*DIM*4); memcpy(capt_do, do_out_buf, SEQ*DIM*4);
-                    float *capt_attn = (float*)malloc(SEQ*DIM*4); memcpy(capt_attn, ac->attn_out, SEQ*DIM*4);
+                    memcpy(cap->dx2[slot], dx2, SEQ*DIM*4);
                     t1=mach_absolute_time(); t_memcpy+=tb_ms(t1-t0);
                     dispatch_group_async(layer_dw_grp, dw_layer_q[L], ^{
                         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, DIM, DIM, SEQ,
-                                    1.0f, capt_do, SEQ, capt_attn, SEQ, 1.0f, gr->Wo, DIM);
-                        free(capt_do); free(capt_attn);
+                                    1.0f, cap->dx2[slot], SEQ, cap->attn_out[slot], SEQ, 1.0f, gr->Wo, DIM);
                     });
 
                     // SDPA backward (ANE)
@@ -595,25 +583,19 @@ int main(int argc, char *argv[]) {
                     io_copy(sdpaBwd2[L]->ioIn, 2*SCORE_CH, kern[L].fwdAttn->ioOut, DIM, 2*DIM, SEQ);
                     ane_eval(sdpaBwd2[L]);
 
-                    io_read_fp16(sdpaBwd2[L]->ioOut, dq, 0,   DIM, SEQ);
-                    io_read_fp16(sdpaBwd2[L]->ioOut, dk, DIM,  DIM, SEQ);
-                    io_read_fp16(kern[L].sdpaBwd1->ioOut, dv, 0, DIM, SEQ);
+                    io_read_fp16(sdpaBwd2[L]->ioOut, cap->dq[slot], 0,   DIM, SEQ);
+                    io_read_fp16(sdpaBwd2[L]->ioOut, cap->dk[slot], DIM, DIM, SEQ);
+                    io_read_fp16(kern[L].sdpaBwd1->ioOut, cap->dv[slot], 0, DIM, SEQ);
 
-                    // dWq/dWk/dWv async
-                    t0=mach_absolute_time();
-                    float *capt_dq = (float*)malloc(SEQ*DIM*4); memcpy(capt_dq, dq, SEQ*DIM*4);
-                    float *capt_dk = (float*)malloc(SEQ*DIM*4); memcpy(capt_dk, dk, SEQ*DIM*4);
-                    float *capt_dv = (float*)malloc(SEQ*DIM*4); memcpy(capt_dv, dv, SEQ*DIM*4);
-                    float *capt_xn = (float*)malloc(SEQ*DIM*4); memcpy(capt_xn, ac->xnorm, SEQ*DIM*4);
-                    t1=mach_absolute_time(); t_memcpy+=tb_ms(t1-t0);
+                    // dWq/dWk/dWv async (xnorm[slot] populated in forward)
                     dispatch_group_async(layer_dw_grp, dw_layer_q[L], ^{
                         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, DIM, DIM, SEQ,
-                                    1.0f, capt_dq, SEQ, capt_xn, SEQ, 1.0f, gr->Wq, DIM);
+                                    1.0f, cap->dq[slot], SEQ, cap->xnorm[slot], SEQ, 1.0f, gr->Wq, DIM);
                         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, DIM, DIM, SEQ,
-                                    1.0f, capt_dk, SEQ, capt_xn, SEQ, 1.0f, gr->Wk, DIM);
+                                    1.0f, cap->dk[slot], SEQ, cap->xnorm[slot], SEQ, 1.0f, gr->Wk, DIM);
                         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, DIM, DIM, SEQ,
-                                    1.0f, capt_dv, SEQ, capt_xn, SEQ, 1.0f, gr->Wv, DIM);
-                        free(capt_dq); free(capt_dk); free(capt_dv); free(capt_xn);
+                                    1.0f, cap->dv[slot], SEQ, cap->xnorm[slot], SEQ, 1.0f, gr->Wv, DIM);
+                        dispatch_semaphore_signal(cap->sem);
                     });
 
                     // QKV backward (ANE)
@@ -748,13 +730,13 @@ int main(int argc, char *argv[]) {
             layer_adam_free(&la[L]);
             layer_acts_free(&acts[L]);
             layer_grads_free(&grads[L]);
+            layer_dwcap_free(&dwcap[L]);
         }
         munmap(token_data, data_len);
         close(data_fd);
         free(rms_final); free(embed); free(grms_final); free(gembed);
         adam_free(&arms_final); adam_free(&aembed);
-        free(dy); free(dffn); free(dh1); free(dh3); free(dx_ffn); free(dx2);
-        free(do_out_buf); free(dq); free(dk); free(dv); free(dx_attn);
+        free(dy); free(dx_ffn); free(dx2); free(dx_attn);
         free(x_cur); free(x_final); free(logits); free(dlogits);
     }
     return 0;
