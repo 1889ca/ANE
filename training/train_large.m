@@ -93,6 +93,12 @@ static bool compile_layer_kernels(LayerKernels *lk, LayerWeights *w) {
     return lk->fwdAttn && lk->fwdFFN && lk->ffnBwd && lk->sdpaBwd1 && lk->qkvBwd;
 }
 
+// Compile weight-free rmsBwd (one per layer, no weights)
+static Kern *compile_rms_bwd(void) {
+    return compile_kern_mil_w(gen_rms_bwd(), @{},
+        3*DIM*SEQ*2, DIM*SEQ*2);
+}
+
 // Compile weight-free sdpaBwd2 (only needs once, no weights)
 static Kern *compile_sdpa_bwd2(void) {
     return compile_kern_mil_w(gen_sdpa_bwd2(), @{},
@@ -102,7 +108,7 @@ static Kern *compile_sdpa_bwd2(void) {
 static void free_layer_kernels(LayerKernels *lk) {
     free_kern(lk->fwdAttn); free_kern(lk->fwdFFN); free_kern(lk->ffnBwd);
     free_kern(lk->sdpaBwd1); free_kern(lk->qkvBwd);
-    // sdpaBwd2 is shared, freed separately
+    // sdpaBwd2, rmsBwd are shared/static, freed separately
     lk->fwdAttn = lk->fwdFFN = lk->ffnBwd = lk->sdpaBwd1 = lk->qkvBwd = NULL;
 }
 
@@ -310,6 +316,14 @@ int main(int argc, char *argv[]) {
             if (!sdpaBwd2[L]) { printf("sdpaBwd2 compile failed\n"); return 1; }
         }
 
+        // Compile static rmsBwd kernels (no weights, one per layer + 1 final)
+        for (int L=0; L<NLAYERS; L++) {
+            kern[L].rmsBwd = compile_rms_bwd();
+            if (!kern[L].rmsBwd) { printf("rmsBwd compile failed at layer %d\n", L); return 1; }
+        }
+        Kern *rmsBwdFinal = compile_rms_bwd();
+        if (!rmsBwdFinal) { printf("rmsBwdFinal compile failed\n"); return 1; }
+
         // Classifier ANE kernels (not per-layer, recompiled each batch with embed weights)
         Kern *cls_fwd = NULL, *cls_bwd = NULL;
         bool use_ane_cls = true;
@@ -334,7 +348,8 @@ int main(int argc, char *argv[]) {
         while (step < total_steps) {
             // Check compile budget
             if (g_compile_count + TOTAL_WEIGHT_KERNELS + (use_ane_cls ? CLS_KERNELS : 0) > max_compiles) {
-                for (int L=0; L<NLAYERS; L++) { free_layer_kernels(&kern[L]); free_kern(sdpaBwd2[L]); }
+                for (int L=0; L<NLAYERS; L++) { free_layer_kernels(&kern[L]); free_kern(sdpaBwd2[L]); free_kern(kern[L].rmsBwd); kern[L].rmsBwd = NULL; }
+                free_kern(rmsBwdFinal); rmsBwdFinal = NULL;
                 free_kern(cls_fwd); free_kern(cls_bwd); cls_fwd = cls_bwd = NULL;
                 double wall = tb_ms(mach_absolute_time() - t_wall_start);
                 save_checkpoint(CKPT_PATH, step, total_steps, lr, last_loss,
@@ -382,12 +397,20 @@ int main(int argc, char *argv[]) {
             dispatch_group_wait(cgrp, DISPATCH_TIME_FOREVER);
             if (!compile_ok) { g_compile_count = max_compiles; continue; }
 
-            // Re-compile sdpaBwd2 if needed (after exec restart)
+            // Re-compile sdpaBwd2 and rmsBwd if needed (after exec restart)
             for (int L=0; L<NLAYERS; L++) {
                 if (!sdpaBwd2[L]) {
                     sdpaBwd2[L] = compile_sdpa_bwd2();
                     if (!sdpaBwd2[L]) { printf("sdpaBwd2 recompile failed\n"); return 1; }
                 }
+                if (!kern[L].rmsBwd) {
+                    kern[L].rmsBwd = compile_rms_bwd();
+                    if (!kern[L].rmsBwd) { printf("rmsBwd recompile failed\n"); return 1; }
+                }
+            }
+            if (!rmsBwdFinal) {
+                rmsBwdFinal = compile_rms_bwd();
+                if (!rmsBwdFinal) { printf("rmsBwdFinal recompile failed\n"); return 1; }
             }
 
             // Compile classifier ANE kernels (embed weights change each batch)
@@ -517,13 +540,18 @@ int main(int argc, char *argv[]) {
                     free(capt_dlogits); free(capt_xfinal);
                 });
 
-                // Final RMSNorm backward
+                // Final RMSNorm backward: dw on CPU, dx on ANE
                 t0=mach_absolute_time();
-                float *dx_rms_final = (float*)calloc(SEQ*DIM, 4);
-                rmsnorm_bwd(dx_rms_final, grms_final, dy, x_cur, rms_final, DIM, SEQ);
-                memcpy(dy, dx_rms_final, SEQ*DIM*4);
-                free(dx_rms_final);
+                rmsnorm_dw(grms_final, dy, x_cur, rms_final, DIM, SEQ);
                 t1=mach_absolute_time(); t_rms_bwd+=tb_ms(t1-t0);
+                if (use_ane_cls)
+                    io_copy(rmsBwdFinal->ioIn, 0, cls_bwd->ioOut, 0, DIM, SEQ);
+                else
+                    io_write_fp16_at(rmsBwdFinal->ioIn, 0, dy, DIM, SEQ);
+                io_copy(rmsBwdFinal->ioIn, DIM, kern[NLAYERS-1].fwdFFN->ioOut, 0, DIM, SEQ);
+                io_write_fp16_vec(rmsBwdFinal->ioIn, 2*DIM, rms_final, DIM, SEQ);
+                ane_eval(rmsBwdFinal);
+                io_read_fp16(rmsBwdFinal->ioOut, dy, 0, DIM, SEQ);
 
                 // ===== BACKWARD (12 layers, reverse) =====
                 for (int L=NLAYERS-1; L>=0; L--) {
@@ -557,12 +585,17 @@ int main(int argc, char *argv[]) {
                                     1.0f, cap->dh3[slot], SEQ, cap->x2norm[slot], SEQ, 1.0f, gr->W3, DIM);
                     });
 
-                    // RMSNorm2 backward
+                    // RMSNorm2 backward: dw on CPU, dx on ANE
                     t0=mach_absolute_time();
-                    memset(dx2, 0, SEQ*DIM*4);
-                    rmsnorm_bwd(dx2, gr->rms_ffn, dx_ffn, ac->x2, lw[L].rms_ffn, DIM, SEQ);
-                    t1=mach_absolute_time(); t_rms_bwd+=tb_ms(t1-t0); t0=t1;
+                    rmsnorm_dw(gr->rms_ffn, dx_ffn, ac->x2, lw[L].rms_ffn, DIM, SEQ);
+                    t1=mach_absolute_time(); t_rms_bwd+=tb_ms(t1-t0);
+                    io_copy(kern[L].rmsBwd->ioIn, 0,   kern[L].ffnBwd->ioOut, 0, DIM, SEQ);
+                    io_copy(kern[L].rmsBwd->ioIn, DIM, kern[L].fwdFFN->ioIn, 0, DIM, SEQ);
+                    io_write_fp16_vec(kern[L].rmsBwd->ioIn, 2*DIM, lw[L].rms_ffn, DIM, SEQ);
+                    ane_eval(kern[L].rmsBwd);
+                    io_read_fp16(kern[L].rmsBwd->ioOut, dx2, 0, DIM, SEQ);
                     // Add residual: dx2 += dy (from skip connection)
+                    t0=mach_absolute_time();
                     for(int i=0;i<SEQ*DIM;i++) dx2[i] += dy[i];
                     t1=mach_absolute_time(); t_resid+=tb_ms(t1-t0);
 
@@ -604,43 +637,20 @@ int main(int argc, char *argv[]) {
                     ane_eval(kern[L].qkvBwd);
                     io_read_fp16(kern[L].qkvBwd->ioOut, dx_attn, 0, DIM, SEQ);
 
-                    // RMSNorm1 backward (using saved layer input)
+                    // RMSNorm1 backward: dw on CPU (while fp32 dy is in dx_attn), dx on ANE
                     t0=mach_absolute_time();
-                    float *dx_rms1 = (float*)calloc(SEQ*DIM, 4);
-                    rmsnorm_bwd(dx_rms1, gr->rms_att, dx_attn, ac->layer_in, lw[L].rms_att, DIM, SEQ);
+                    rmsnorm_dw(gr->rms_att, dx_attn, ac->layer_in, lw[L].rms_att, DIM, SEQ);
                     t1=mach_absolute_time(); t_rms_bwd+=tb_ms(t1-t0);
+                    io_copy(kern[L].rmsBwd->ioIn, 0,   kern[L].qkvBwd->ioOut, 0, DIM, SEQ);
+                    io_copy(kern[L].rmsBwd->ioIn, DIM, kern[L].fwdAttn->ioIn, 0, DIM, SEQ);
+                    io_write_fp16_vec(kern[L].rmsBwd->ioIn, 2*DIM, lw[L].rms_att, DIM, SEQ);
+                    ane_eval(kern[L].rmsBwd);
+                    io_read_fp16(kern[L].rmsBwd->ioOut, dx_attn, 0, DIM, SEQ);
 
-                    // dy for next layer (going backward) = dx_rms1 + dx2 residual
-                    // Actually: layer output = layer_input + o_out, and x2 = layer_input + o_out
-                    // So dx(layer_input) = dx_attn_rmsnorm + dx2 (residual from attn skip)
-                    // Wait, dx2 already includes the attn skip residual gradient.
-                    // dy = dx_rms1 (through rmsnorm1) is the gradient to the layer input
-                    // But there's also the skip connection: layer_input → x2 directly
-                    // So total gradient to layer_input = dx_rms1 + dx2_skip
-                    // dx2 was computed as rmsnorm2_bwd + dy(ffn_skip), which already flows to x2
-                    // x2 = layer_input + o_out, so d(layer_input) from x2 path = dx2
-                    // And d(layer_input) from attn path through rmsnorm1 = dx_rms1
-                    // Total: dy_prev = dx_rms1 (attn rmsnorm path)
-                    // Wait no - dx2 = d(loss)/d(x2), not d(loss)/d(layer_input)
-                    // d(layer_input) = d(loss)/d(x2) * d(x2)/d(layer_input) = dx2 (since x2 = input + o_out, d(x2)/d(input) = 1)
-                    // Plus the path through rmsnorm1: dx_rms1
-                    // Hmm but dx2 was already used as input to SDPA backward... let me reconsider.
-                    //
-                    // Actually the gradient flow is:
-                    //   dy → split to (dffn, dy_skip)  [dy_skip = dy due to residual]
-                    //   dffn → ffnBwd → dx_ffn
-                    //   dx_ffn → rmsnorm2_bwd → dx_rms2
-                    //   dx2 = dx_rms2 + dy  (skip connection from residual x2 → output)
-                    //   dx2 → sdpaBwd → dx_attn through Wo^T
-                    //   dx_attn → qkvBwd → dx_qkv
-                    //   dx_qkv → rmsnorm1_bwd → dx_rms1
-                    //   dy_prev_layer = dx_rms1 + dx2  (skip connection input → x2)
-                    //
-                    // So: dy for previous layer = dx_rms1 + dx2
+                    // dy for previous layer = dx_attn (through rmsnorm1) + dx2 (skip connection)
                     t0=mach_absolute_time();
-                    for(int i=0;i<SEQ*DIM;i++) dy[i] = dx_rms1[i] + dx2[i];
+                    for(int i=0;i<SEQ*DIM;i++) dy[i] = dx_attn[i] + dx2[i];
                     t1=mach_absolute_time(); t_resid+=tb_ms(t1-t0);
-                    free(dx_rms1);
                 }
 
                 // Embedding backward — only wait for embed dW (not layer dW)
@@ -723,9 +733,11 @@ int main(int argc, char *argv[]) {
 
         // Cleanup
         free_kern(cls_fwd); free_kern(cls_bwd);
+        free_kern(rmsBwdFinal);
         for (int L=0; L<NLAYERS; L++) {
             free_layer_kernels(&kern[L]);
             free_kern(sdpaBwd2[L]);
+            free_kern(kern[L].rmsBwd);
             layer_weights_free(&lw[L]);
             layer_adam_free(&la[L]);
             layer_acts_free(&acts[L]);

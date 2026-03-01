@@ -298,6 +298,54 @@ static NSString *gen_cls_bwd(void) {
     return m;
 }
 
+// RMSNorm backward (dx only, weight-free): input [1, 3*DIM, 1, SEQ] → output [1, DIM, 1, SEQ]
+// Input channels: [0..DIM) = dy, [DIM..2*DIM) = x, [2*DIM..3*DIM) = w (pos 0 only)
+static NSString *gen_rms_bwd(void) {
+    float invd = 1.0f/(float)DIM;
+    NSMutableString *m = [NSMutableString string];
+    [m appendString:MIL_HDR];
+    [m appendFormat:@"    func main<ios18>(tensor<fp16, [1, %d, 1, %d]> input) {\n", 3*DIM, SEQ];
+
+    // Slice dy, x, w from packed input
+    [m appendString:@"        tensor<int32, [4]> b0 = const()[name=string(\"b0\"), val=tensor<int32, [4]>([0,0,0,0])];\n"];
+    [m appendFormat:@"        tensor<int32, [4]> sz_d = const()[name=string(\"szd\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> dy = slice_by_size(x=input,begin=b0,size=sz_d)[name=string(\"sdy\")];\n", DIM, SEQ];
+    [m appendFormat:@"        tensor<int32, [4]> bx = const()[name=string(\"bx\"), val=tensor<int32, [4]>([0,%d,0,0])];\n", DIM];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> x = slice_by_size(x=input,begin=bx,size=sz_d)[name=string(\"sx\")];\n", DIM, SEQ];
+    [m appendFormat:@"        tensor<int32, [4]> bw = const()[name=string(\"bw\"), val=tensor<int32, [4]>([0,%d,0,0])];\n", 2*DIM];
+    [m appendFormat:@"        tensor<int32, [4]> sz_w = const()[name=string(\"szw\"), val=tensor<int32, [4]>([1,%d,1,1])];\n", DIM];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,1]> w = slice_by_size(x=input,begin=bw,size=sz_w)[name=string(\"sw\")];\n", DIM];
+
+    // RMS norm: rrms = rsqrt(mean(x^2) + eps)
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> x2 = mul(x=x,y=x)[name=string(\"x2\")];\n", DIM, SEQ];
+    [m appendString:@"        tensor<int32, [1]> rax = const()[name=string(\"rax\"), val=tensor<int32, [1]>([1])];\n"];
+    [m appendString:@"        bool kd = const()[name=string(\"kd\"), val=bool(true)];\n"];
+    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> ss = reduce_sum(x=x2,axes=rax,keep_dims=kd)[name=string(\"ss\")];\n", SEQ];
+    [m appendFormat:@"        fp16 invd = const()[name=string(\"invd\"), val=fp16(%f)];\n", invd];
+    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> mean_ss = mul(x=ss,y=invd)[name=string(\"mss\")];\n", SEQ];
+    [m appendString:@"        fp16 eps = const()[name=string(\"eps\"), val=fp16(0.00001)];\n"];
+    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> eps_add = add(x=mean_ss,y=eps)[name=string(\"ea\")];\n", SEQ];
+    [m appendString:@"        fp16 nhalf = const()[name=string(\"nhalf\"), val=fp16(-0.5)];\n"];
+    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> rrms = pow(x=eps_add,y=nhalf)[name=string(\"rrms\")];\n", SEQ];
+
+    // Weighted dot: dot = sum(dy * x * w) * rrms^2 / DIM
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> dy_x = mul(x=dy,y=x)[name=string(\"dyx\")];\n", DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> dy_x_w = mul(x=dy_x,y=w)[name=string(\"dyxw\")];\n", DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> dot = reduce_sum(x=dy_x_w,axes=rax,keep_dims=kd)[name=string(\"dot\")];\n", SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> rrms2 = mul(x=rrms,y=rrms)[name=string(\"rr2\")];\n", SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> scaled = mul(x=dot,y=rrms2)[name=string(\"scl\")];\n", SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> scaled_inv = mul(x=scaled,y=invd)[name=string(\"sci\")];\n", SEQ];
+
+    // dx = w * rrms * (dy - x * scaled_inv)
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> x_term = mul(x=x,y=scaled_inv)[name=string(\"xt\")];\n", DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> diff = sub(x=dy,y=x_term)[name=string(\"dif\")];\n", DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> w_diff = mul(x=w,y=diff)[name=string(\"wd\")];\n", DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> dx = mul(x=w_diff,y=rrms)[name=string(\"dx\")];\n", DIM, SEQ];
+
+    [m appendString:@"    } -> (dx);\n}\n"];
+    return m;
+}
+
 // Mask blob (causal mask [SEQ,SEQ])
 static NSData *g_mask_blob = nil;
 static NSData *get_mask_blob(void) {

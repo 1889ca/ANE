@@ -77,6 +77,13 @@ static void io_copy(IOSurfaceRef dst, int dst_ch, IOSurfaceRef src, int src_ch, 
     IOSurfaceUnlock(src, kIOSurfaceLockReadOnly, NULL);
     IOSurfaceUnlock(dst, 0, NULL);
 }
+static void io_write_fp16_vec(IOSurfaceRef io, int ch_off, const float *src, int dim, int sp) {
+    IOSurfaceLock(io, 0, NULL);
+    _Float16 *base = (_Float16 *)IOSurfaceGetBaseAddress(io);
+    for (int c = 0; c < dim; c++)
+        base[(ch_off + c) * sp] = (_Float16)src[c];
+    IOSurfaceUnlock(io, 0, NULL);
+}
 static void io_write_fp16_at(IOSurfaceRef s, int ch_off, const float *data, int channels, int sp) {
     IOSurfaceLock(s, 0, NULL);
     cvt_f32_f16((_Float16*)IOSurfaceGetBaseAddress(s) + ch_off * sp, data, channels * sp);

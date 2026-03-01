@@ -3,6 +3,7 @@
 #include "stories_config.h"
 
 static float *g_rms_tmp = NULL;
+static float *g_rms_ss = NULL;
 
 static void rmsnorm(float *out, const float *x, const float *w, int d, int S) {
     if (!g_rms_tmp) g_rms_tmp = (float*)malloc(S*4);
@@ -21,36 +22,23 @@ static void rmsnorm(float *out, const float *x, const float *w, int d, int S) {
     free(ss);
 }
 
-static void rmsnorm_bwd(float *dx, float *dw, const float *dy, const float *x, const float *w, int d, int S) {
+static void rmsnorm_dw(float *dw, const float *dy, const float *x, const float *w, int d, int S) {
     if (!g_rms_tmp) g_rms_tmp = (float*)malloc(S*4);
-    float *ss = (float*)calloc(S, sizeof(float));
+    if (!g_rms_ss) g_rms_ss = (float*)malloc(S*4);
+    memset(g_rms_ss, 0, S*4);
     for (int i=0; i<d; i++) {
         vDSP_vmul(x+i*S, 1, x+i*S, 1, g_rms_tmp, 1, (vDSP_Length)S);
-        vDSP_vadd(g_rms_tmp, 1, ss, 1, ss, 1, (vDSP_Length)S);
+        vDSP_vadd(g_rms_tmp, 1, g_rms_ss, 1, g_rms_ss, 1, (vDSP_Length)S);
     }
     float invd = 1.0f/d, eps=1e-5f;
-    vDSP_vsmsa(ss, 1, &invd, &eps, ss, 1, (vDSP_Length)S);
-    float *rrms = (float*)malloc(S*4);
-    int n = S; vvrsqrtf(rrms, ss, &n);
-    float *dot = (float*)calloc(S, sizeof(float));
+    vDSP_vsmsa(g_rms_ss, 1, &invd, &eps, g_rms_ss, 1, (vDSP_Length)S);
+    int n = S; vvrsqrtf(g_rms_ss, g_rms_ss, &n);  // g_rms_ss = rrms
     for (int i=0; i<d; i++) {
         vDSP_vmul(dy+i*S, 1, x+i*S, 1, g_rms_tmp, 1, (vDSP_Length)S);
-        vDSP_vsma(g_rms_tmp, 1, &w[i], dot, 1, dot, 1, (vDSP_Length)S);
-    }
-    vDSP_vmul(rrms, 1, rrms, 1, ss, 1, (vDSP_Length)S);
-    vDSP_vsmul(ss, 1, &invd, ss, 1, (vDSP_Length)S);
-    vDSP_vmul(dot, 1, ss, 1, dot, 1, (vDSP_Length)S);
-    for (int i=0; i<d; i++) {
-        vDSP_vmul(x+i*S, 1, dot, 1, g_rms_tmp, 1, (vDSP_Length)S);
-        vDSP_vsub(g_rms_tmp, 1, dy+i*S, 1, g_rms_tmp, 1, (vDSP_Length)S);
-        vDSP_vmul(g_rms_tmp, 1, rrms, 1, g_rms_tmp, 1, (vDSP_Length)S);
-        vDSP_vsmul(g_rms_tmp, 1, &w[i], dx+i*S, 1, (vDSP_Length)S);
-        vDSP_vmul(dy+i*S, 1, x+i*S, 1, g_rms_tmp, 1, (vDSP_Length)S);
-        vDSP_vmul(g_rms_tmp, 1, rrms, 1, g_rms_tmp, 1, (vDSP_Length)S);
+        vDSP_vmul(g_rms_tmp, 1, g_rms_ss, 1, g_rms_tmp, 1, (vDSP_Length)S);
         float s; vDSP_sve(g_rms_tmp, 1, &s, (vDSP_Length)S);
         dw[i] += s;
     }
-    free(ss); free(rrms); free(dot);
 }
 
 static void adam_update(float *w, const float *g, AdamState *s, int t, float lr, float b1, float b2, float eps) {
