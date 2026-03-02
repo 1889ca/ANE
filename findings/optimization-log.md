@@ -551,3 +551,25 @@ Current profile (20 steps, accum=50, post tiled cls_bwd):
 3. **bwd ane ~26ms** — 74 ANE evals at ~0.35ms each. Beyond SDPA fusion, could merge qkvBwd+rmsBwd into single kernel. **~3ms additional potential, high risk.**
 4. **elem ~13ms** — xent=5.0 (CPU gradient after ANE softmax), rms_bwd=2.8, memcpy=2.2. Diminishing returns individually.
 5. **cls_bwd ~4ms** — Could try 8×4K tiling for further reduction, but diminishing returns from current 4.0ms.
+
+---
+
+## Observations & Structural Limitations
+
+### What has been demonstrated
+
+- **First (known) transformer training loop running entirely on Apple Neural Engine.** Forward and backward pass on ANE, weight updates and gradient accumulation on CPU. The MIL→ANE compilation pathway works for training, not just inference.
+- **2.5x optimization from baseline** (190ms→76ms) through 14 incremental changes spanning kernel fusion, IO batching, async dW overlap, tiled convolutions, and ANE softmax.
+- **End-to-end training pipeline:** pretrained weight loading, checkpoint save/load with Adam state, cosine LR schedule, text generation eval. The checkpoint survives exec() restarts and produces valid outputs.
+
+### Structural ceilings
+
+1. **No RoPE = no real positional understanding.** Causal masking provides weak implicit position signal, but the model can't learn position-dependent patterns. This is the #1 quality bottleneck. Adding RoPE to MIL requires sin/cos lookup tables + elementwise ops in the SDPA kernel (both forward and backward). Feasible but significant.
+
+2. **fp16-only compute path caps LR at ~3e-5.** The entire forward/backward runs in fp16 on ANE. Only gradient accumulation and adam state are fp32. This means gradient noise is much higher than mixed-precision training (where forward activations are fp16 but backward accumulation uses fp32 master weights). The practical effect: training converges slowly and can't use aggressive LR schedules.
+
+3. **Recompilation overhead (45% of wall time).** ANE has no writable weight registers — every weight update requires recompiling MIL programs into ANE executables. With 62 weight-bearing kernels × every 50 steps, compilation dominates wall time. This is fundamental to the CoreML/MIL approach and won't improve without access to lower-level ANE APIs.
+
+4. **5.6% ANE utilization.** Of 15.8 theoretical TFLOPS, we sustain 0.89. The ANE compute is fast (35ms/step for fwd+bwd) but IO shuffling (21ms) and CPU work (13ms elem + 222ms overlapped dW) dominate. The ANE spends most of its time waiting for data.
+
+5. **Single-sequence batch size.** ANE IOSurface layout fixes the sequence dimension at compile time. Batching would require compiling kernels with batch dimension baked in, multiplying IOSurface sizes by batch size. At seq=256, a batch of 4 would push several IOSurfaces past practical limits.
