@@ -225,22 +225,24 @@ Old `rmsnorm_bwd()` removed entirely.
 - `dx_rms1` calloc+free per layer (ANE writes dx directly to `dx_attn`)
 - `dx_rms_final` calloc+memcpy+free (ANE writes dx directly to `dy`)
 
-**Result (20 steps, accum=50):**
+**Result (100 steps, accum=50, 2 batches):**
 ```
-97.4 ms/step
-  ane=10.0  io=4.5  cls=2.3  rms_fwd=0.1
-  elem=29.5 [xent=14.3 memcpy=1.1 rms_bwd=3.3 resid=1.0 embed=1.0 embed_bwd=8.7]
+102.7 ms/step (avg), batch1=101.1, batch2=104.2
+  Batch 1: ane=9.5 io=4.0 cls=1.9 rms_fwd=0.1
+           elem=33.2 [xent=15.6 memcpy=1.2 rms_bwd=4.0 resid=1.5 embed=0.9 embed_bwd=9.9]
+  Batch 2: ane=9.3 io=4.6 cls=2.0 rms_fwd=0.1
+           elem=34.5 [xent=16.1 memcpy=1.3 rms_bwd=5.4 resid=1.5 embed=1.5 embed_bwd=8.7]
 ```
 
-| Metric | Before | After | Change |
+| Metric | Before (est.) | After (100-step avg) | Change |
 |---|---|---|---|
-| ms/step | ~99 | 97.4 | -1.6ms |
-| rms_bwd | 9.1 | 3.3 | **-5.8ms** |
-| io | 4.7 | 4.5 | -0.2ms |
-| ane | 10.3 | 10.0 | -0.3ms |
+| ms/step | ~106 | 102.7 | **-3.3ms** |
+| rms_bwd | ~9 | ~4.7 | **-4.3ms** |
+| io | ~5 | ~4.3 | -0.7ms |
+| ane | ~10 | ~9.4 | -0.6ms |
 | Compiles | 74 | 87 | +13 (well within 200 budget) |
 
-**Why only ~1.6ms net savings despite 5.8ms rms_bwd reduction:** The 25 ANE rmsBwd evals and 50 io_copy ops add ~1-2ms to ANE/IO timers. Additionally, the remaining 3.3ms of rms_bwd is the `rmsnorm_dw` function (25 calls × rrms recomputation + DIM reduction), which is bounded by vDSP throughput on the rrms recomputation loop (DIM=768 iterations × SEQ=256 vDSP ops each).
+**Note on rms_bwd variance:** 4.0ms (batch 1) vs 5.4ms (batch 2) — the `rmsnorm_dw` CPU work competes with async dW cblas for P-core time. Under heavier dW overlap (batch 2, warmer caches, more in-flight sgemms), the vDSP loops slow down. The 20-step measurement (3.3ms) was optimistic; 100-step average (~4.7ms) is more representative.
 
 **Correctness:** Loss unchanged (step 0: 4.3143, step 10: 3.6053).
 
@@ -250,23 +252,23 @@ Old `rmsnorm_bwd()` removed entirely.
 
 ## Remaining Optimization Targets
 
-Current profile (20 steps, accum=50):
+Current profile (100 steps, accum=50, batch 2 = warm):
 ```
-97.4 ms/step
-  ane=10.0  io=4.5  cls=2.3  rms_fwd=0.1
-  elem=29.5 [xent=14.3 memcpy=1.1 rms_bwd=3.3 resid=1.0 embed=1.0 embed_bwd=8.7]
-  ~48ms unaccounted = async dW cblas overlap
+104.2 ms/step (warm batch)
+  ane=9.3  io=4.6  cls=2.0  rms_fwd=0.1
+  elem=34.5 [xent=16.1 memcpy=1.3 rms_bwd=5.4 resid=1.5 embed=1.5 embed_bwd=8.7]
+  ~49ms unaccounted = async dW cblas overlap
 ```
 
 ### Prioritized by risk-adjusted impact
 
-1. **xent ~14ms** — Fused cross-entropy on ANE (see hivemind analysis above). **~14ms, high risk.** Treat as research spike.
+1. **xent ~16ms** — Fused cross-entropy on ANE (see hivemind analysis above). **~16ms, high risk.** Treat as research spike.
 2. **embed_bwd ~9ms** — Embed dW wait + scatter-add. Dominated by dispatch_group_wait on embed outer product sgemm. **~9ms, medium effort.**
-3. **io ~4.5ms** — Keep activations in fp16 end-to-end, skip fp32↔fp16 conversion. Requires numerical stability analysis for backward pass. **~4.5ms, medium risk.**
-4. **rms_bwd ~3.3ms** — Remaining CPU dw cost. Could precompute rrms in forward pass and cache it, eliminating the recomputation loop. **~2ms potential, low risk.**
-5. **resid ~1ms** — Backward residual adds. Could fuse into backward ANE kernels. **~1ms, diminishing returns.**
+3. **rms_bwd ~5ms** — Remaining CPU dw cost. Could precompute rrms in forward pass and cache it, eliminating the recomputation loop. **~3ms potential, low risk.**
+4. **io ~5ms** — Keep activations in fp16 end-to-end, skip fp32↔fp16 conversion. Requires numerical stability analysis for backward pass. **~5ms, medium risk.**
+5. **resid ~1.5ms** — Backward residual adds. Could fuse into backward ANE kernels. **~1.5ms, diminishing returns.**
 
 ### Architecture-level (larger refactors)
-- Fuse rmsnorm + conv into single ANE kernel (reduce 74 kernel evals/step)
+- Fuse rmsnorm + conv into single ANE kernel (reduce kernel eval count)
 - Pipeline: overlap step N's backward with step N+1's forward (double-buffer IOSurfaces)
 - Full fp16 activation path (eliminate io conversion entirely)
