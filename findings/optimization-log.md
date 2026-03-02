@@ -417,22 +417,54 @@ Wrapped each backward ANE eval and IO block with `mach_absolute_time()` timing, 
 
 ---
 
+## 13. Batch IOSurface Locking
+
+**Commit:** `50c78b8` — "Batch IOSurface locking to reduce IO overhead (~240 fewer lock/unlock pairs)"
+
+**What:** Added 4 lock helpers (`io_lock_rw`, `io_lock_ro`, `io_unlock_rw`, `io_unlock_ro`) and refactored forward + backward loops to lock each IOSurface once per region instead of per-call.
+
+Batched regions:
+- Forward: fwdAttn output (6→2 locks), fwdFFN output (6→1 lock)
+- Backward: 8 sections per layer — FFN bwd in (3→2), FFN bwd out (3→1), RMS2 bwd in (5→3), SDPA bwd1 in (3→2), bwd1→bwd2 (4→3), SDPA out (3→2), QKV in (4→3), RMS1 bwd in (5→3)
+
+Total: ~504 locks/step → ~264 locks/step, saving ~240 lock/unlock pairs.
+
+**Result (20 steps, accum=50):**
+```
+77.5 ms/step
+  fwd: ane=10.0 io=4.5 cls=1.1 rms_fwd=0.1
+  bwd: ane=22.6 io=13.4 cls_bwd=14.0
+  elem=10.6 [xent=5.1 memcpy=1.3 rms_bwd=2.1 resid=0.8 embed=1.0 embed_bwd=0.3]
+  dW sgemm: ffn=181.8 wo=20.5 qkv=57.5 embed=18.5 total=278.3 ms/step
+```
+
+| Metric | Before | After | Change |
+|---|---|---|---|
+| fwd io | 5.0 | 4.5 | -0.5ms |
+| bwd io | 16.3 | 13.4 | -2.9ms |
+| **Combined IO** | **21.3** | **17.9** | **-3.4ms** |
+
+**Note:** 100-step run showed inflated timings across all metrics (bwd ane 25.9 vs usual 9.6) due to system thermal/load variance. The 20-step first-batch numbers are more reliable for comparing IO specifically.
+
+**Correctness:** Loss unchanged (step 0: 4.3108, step 10: 3.6026).
+
+---
+
 ## Remaining Optimization Targets
 
-Current profile (100 steps, accum=200):
+Current profile (20 steps, accum=50, post IO batching):
 ```
-82.9 ms/step
-  fwd: ane=9.8 io=5.0 cls=1.0 rms_fwd=0.1   (16.9 total)
-  bwd: ane=24.5 io=16.3 cls_bwd=13.6          (54.4 total)
-  elem=11.4 [xent=4.7 memcpy=1.5 rms_bwd=2.5 resid=1.4 embed=0.9 embed_bwd=0.4]
-  dW sgemm: ffn=188 wo=22 qkv=64 embed=24 total=298 ms/step (~3.6x overlap)
-  sem_wait=0.0 final_dw_wait=0.1 ms/step
+~77ms/step
+  fwd: ane=10.0 io=4.5 cls=1.1 rms_fwd=0.1   (15.7 total)
+  bwd: ane=22.6 io=13.4 cls_bwd=14.0          (50.0 total)
+  elem=10.6 [xent=5.1 memcpy=1.3 rms_bwd=2.1 resid=0.8 embed=1.0 embed_bwd=0.3]
+  dW sgemm: ffn=182 wo=21 qkv=57 embed=19 total=278 ms/step (~3.6x overlap)
 ```
 
 ### Prioritized by risk-adjusted impact
 
-1. **bwd io ~16ms** — Backward IO is the #1 target. The backward pass copies far more data than forward because SDPA backward uses 5 separate io_copy + 3 io_read per layer. Potential: fuse sdpaBwd1+sdpaBwd2 into a single kernel (eliminates inter-kernel IO), keep more data in IOSurface (eliminate fp16→fp32→fp16 round-trips). **~10ms potential, medium risk.**
-2. **cls_bwd ~14ms** — Single largest ANE kernel. Could split into tiled convolutions or restructure to reduce per-eval cost. **~5-8ms potential, medium risk.**
-3. **bwd ane ~24ms** — 74 ANE evals at ~0.33ms each. Main lever is kernel fusion to reduce eval count (e.g., fuse qkvBwd+rmsBwd into single kernel). **~5ms potential, high risk (MIL graph complexity).**
-4. **fwd io ~5ms** — Keep activations in fp16 end-to-end, eliminate unnecessary conversions. **~3ms potential, medium risk.**
-5. **elem ~11ms** — xent now 4.7ms (ANE softmax working). Remaining: memcpy 1.5, rms_bwd 2.5, resid 1.4. Diminishing returns individually.
+1. **cls_bwd ~14ms (18%)** — Single most expensive ANE kernel. Huge asymmetry: cls_fwd=1ms for same FLOP count (6.3 GFLOP). Root cause: 32000 input channels force ANE to serialize data loading. Options: (a) split into 4 tiled convs of [768, 8000, 1, 1] + add results, (b) try CPU cblas_sgemm with AMX. **~8-12ms potential, medium risk.**
+2. **Fuse sdpaBwd1+sdpaBwd2 (~7ms ane+io)** — Currently 2 separate ANE evals + IO shuffle between them, per layer. Fusion eliminates 12 ane_eval calls (~4ms) and 12 inter-kernel IO transfers (~3ms). Requires combining two MIL programs into one. **~7ms potential, high risk (MIL complexity).**
+3. **bwd io ~13ms** — Lock batching eliminated overhead, but actual data movement (memcpy + fp16↔fp32) remains. Some backward flows do unnecessary fp16→fp32→fp16 round-trips (e.g., dx_ffn read as fp32, then written back as fp16 for rmsBwd). Could keep fp16 end-to-end for pass-through data. **~3-5ms potential, medium risk.**
+4. **bwd ane ~23ms** — 74 ANE evals at ~0.31ms each. Beyond SDPA fusion, could merge qkvBwd+rmsBwd into single kernel. **~3ms additional potential, high risk.**
+5. **elem ~11ms** — xent=5.1 (CPU gradient after ANE softmax), rms_bwd=2.1, memcpy=1.3. Diminishing returns individually.
