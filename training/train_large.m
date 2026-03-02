@@ -4,6 +4,7 @@
 #include "stories_io.h"
 #include "stories_mil.h"
 #include "stories_cpu_ops.h"
+#include "metal_gpu.h"
 
 #define CKPT_PATH "ane_stories110M_ckpt.bin"
 #define MODEL_PATH "../../assets/models/stories110M.bin"
@@ -200,6 +201,7 @@ int main(int argc, char *argv[]) {
         setbuf(stdout, NULL);
         ane_init();
         mach_timebase_info(&g_tb);
+        bool gpu_rope = false;  // set after arg parsing
 
         int total_steps = 10000;
         float lr = 3e-4f, lr_min = 0.0f;
@@ -211,8 +213,10 @@ int main(int argc, char *argv[]) {
 
         // Parse args
         bool do_resume = false;
+        bool use_cpu_rope = false;
         for (int i=1; i<argc; i++) {
             if (strcmp(argv[i], "--resume") == 0) do_resume = true;
+            else if (strcmp(argv[i], "--cpu-rope") == 0) use_cpu_rope = true;
             else if (strcmp(argv[i], "--steps") == 0 && i+1<argc) total_steps = atoi(argv[++i]);
             else if (strcmp(argv[i], "--lr") == 0 && i+1<argc) lr = atof(argv[++i]);
             else if (strcmp(argv[i], "--accum") == 0 && i+1<argc) accum_steps = atoi(argv[++i]);
@@ -220,6 +224,14 @@ int main(int argc, char *argv[]) {
             else if (strcmp(argv[i], "--warmup") == 0 && i+1<argc) warmup_steps = atoi(argv[++i]);
             else if (strcmp(argv[i], "--max-compiles") == 0 && i+1<argc) max_compiles = atoi(argv[++i]);
         }
+
+        // Initialize GPU RoPE (unless --cpu-rope fallback)
+        if (!use_cpu_rope) {
+            gpu_rope = metal_init();
+            if (!gpu_rope) printf("  [metal] GPU RoPE init failed, falling back to CPU\n");
+        }
+        if (use_cpu_rope) printf("  [rope] Using CPU RoPE (--cpu-rope)\n");
+        else if (gpu_rope) printf("  [rope] Using GPU RoPE\n");
 
         // Allocate per-layer state
         LayerWeights lw[NLAYERS];
@@ -521,8 +533,32 @@ int main(int argc, char *argv[]) {
                     t1=mach_absolute_time(); t_io+=tb_ms(t1-t0); t0=t1;
                     ane_eval(kern[L].qkvFwd);
                     t1=mach_absolute_time(); t_ane+=tb_ms(t1-t0); t0=t1;
-                    { // Read Q,K→fp32, xnorm+rrms for dW capture
+                    if (gpu_rope) {
+                    // GPU path: read only xnorm+rrms (for dW), V+x_cur to attnFwd ch2-3, GPU RoPE ch0-1
+                    { // Read xnorm + rrms from qkvFwd->ioOut (needed for dW sgemm)
                     const _Float16 *qkv_p = io_lock_ro(kern[L].qkvFwd->ioOut);
+                    cvt_f16_f32(dwcap[L].xnorm[slot],    qkv_p + 3*DIM*SEQ, DIM * SEQ);
+                    cvt_f16_f32(ac->rrms_att,            qkv_p + 4*DIM*SEQ, 1 * SEQ);
+                    io_unlock_ro(kern[L].qkvFwd->ioOut);
+                    }
+                    t1=mach_absolute_time(); t_io+=tb_ms(t1-t0); t0=t1;
+
+                    { // CPU: write V (ch2) + x_cur (ch3) to attnFwd->ioIn
+                    _Float16 *attn_in = io_lock_rw(kern[L].attnFwd->ioIn);
+                    const _Float16 *qkv_p = io_lock_ro(kern[L].qkvFwd->ioOut);
+                    memcpy(attn_in + 2*DIM*SEQ, qkv_p + 2*DIM*SEQ, DIM * SEQ * sizeof(_Float16));
+                    io_unlock_ro(kern[L].qkvFwd->ioOut);
+                    cvt_f32_f16(attn_in + 3*DIM*SEQ,   x_cur,   DIM * SEQ);
+                    io_unlock_rw(kern[L].attnFwd->ioIn);
+                    }
+
+                    // GPU RoPE: qkvFwd->ioOut[Q,K] → attnFwd->ioIn[Q_rope,K_rope] (ch0,1)
+                    metal_rope_fwd(kern[L].qkvFwd->ioOut, kern[L].attnFwd->ioIn,
+                                   0, DIM*SEQ, 0, DIM*SEQ);
+                    t1=mach_absolute_time(); t_io+=tb_ms(t1-t0); t0=t1;
+                    } else {
+                    // CPU fallback: fp16→fp32→rotate→fp32→fp16
+                    { const _Float16 *qkv_p = io_lock_ro(kern[L].qkvFwd->ioOut);
                     cvt_f16_f32(rope_q,                  qkv_p,              DIM * SEQ);
                     cvt_f16_f32(rope_k,                  qkv_p + DIM*SEQ,    DIM * SEQ);
                     cvt_f16_f32(dwcap[L].xnorm[slot],    qkv_p + 3*DIM*SEQ, DIM * SEQ);
@@ -530,14 +566,9 @@ int main(int argc, char *argv[]) {
                     io_unlock_ro(kern[L].qkvFwd->ioOut);
                     }
                     t1=mach_absolute_time(); t_io+=tb_ms(t1-t0); t0=t1;
-
-                    // CPU RoPE: in-place rotation on fp32 Q,K
                     cpu_rope_cf(rope_q, rope_k, SEQ, HEADS, HD);
                     t1=mach_absolute_time(); t_io+=tb_ms(t1-t0); t0=t1;
-
-                    // Attention forward: RoPE'd Q,K + V + x_residual → x2, attn_out
-                    { // Write attnFwd->ioIn: Q_rope, K_rope (fp32→fp16), V (fp16 copy), x_cur (fp32→fp16)
-                    _Float16 *attn_in = io_lock_rw(kern[L].attnFwd->ioIn);
+                    { _Float16 *attn_in = io_lock_rw(kern[L].attnFwd->ioIn);
                     const _Float16 *qkv_p = io_lock_ro(kern[L].qkvFwd->ioOut);
                     cvt_f32_f16(attn_in,               rope_q,  DIM * SEQ);
                     cvt_f32_f16(attn_in + DIM*SEQ,     rope_k,  DIM * SEQ);
@@ -547,6 +578,7 @@ int main(int argc, char *argv[]) {
                     io_unlock_rw(kern[L].attnFwd->ioIn);
                     }
                     t1=mach_absolute_time(); t_io+=tb_ms(t1-t0); t0=t1;
+                    }
                     ane_eval(kern[L].attnFwd);
                     t1=mach_absolute_time(); t_ane+=tb_ms(t1-t0); t0=t1;
                     { // Read attnFwd->ioOut: x2→fwdFFN->ioIn + ac->x2, attn_out→dwcap
@@ -788,19 +820,41 @@ int main(int argc, char *argv[]) {
                     ane_eval(sdpaBwd2[L]);
                     t1=mach_absolute_time(); t_bwd_ane+=tb_ms(t1-t0); t0=t1;
 
-                    { // Batch: sdpaBwd2->ioOut (2 reads→1)
-                    const _Float16 *bwd2_p = io_lock_ro(sdpaBwd2[L]->ioOut);
+                    if (gpu_rope) {
+                    // GPU path: inverse RoPE on GPU, read back for dW sgemm
+                    // 1. GPU inverse RoPE: sdpaBwd2->ioOut[dQ,dK] → qkvBwd->ioIn[ch0,ch1]
+                    metal_rope_bwd(sdpaBwd2[L]->ioOut, kern[L].qkvBwd->ioIn,
+                                   0, DIM*SEQ, 0, DIM*SEQ);
+
+                    // 2. CPU: copy dV to qkvBwd->ioIn channel 2
+                    { _Float16 *qkv_in = io_lock_rw(kern[L].qkvBwd->ioIn);
+                    const _Float16 *bwd1_p = io_lock_ro(kern[L].sdpaBwd1->ioOut);
+                    memcpy(qkv_in + 2*DIM*SEQ, bwd1_p, DIM * SEQ * sizeof(_Float16));
+                    io_unlock_ro(kern[L].sdpaBwd1->ioOut);
+                    io_unlock_rw(kern[L].qkvBwd->ioIn);
+                    }
+
+                    // 3. Read un-RoPE'd dQ,dK from qkvBwd->ioIn as fp32 for dW sgemm
+                    { const _Float16 *qkv_in = io_lock_ro(kern[L].qkvBwd->ioIn);
+                    cvt_f16_f32(cap->dq[slot], qkv_in,            DIM * SEQ);
+                    cvt_f16_f32(cap->dk[slot], qkv_in + DIM*SEQ,  DIM * SEQ);
+                    io_unlock_ro(kern[L].qkvBwd->ioIn);
+                    }
+                    io_read_fp16(kern[L].sdpaBwd1->ioOut, cap->dv[slot], 0, DIM, SEQ);
+                    t1=mach_absolute_time(); t_bwd_io+=tb_ms(t1-t0);
+                    } else {
+                    // CPU fallback: read dQ,dK → rotate → write back
+                    { const _Float16 *bwd2_p = io_lock_ro(sdpaBwd2[L]->ioOut);
                     cvt_f16_f32(cap->dq[slot], bwd2_p,            DIM * SEQ);
                     cvt_f16_f32(cap->dk[slot], bwd2_p + DIM*SEQ,  DIM * SEQ);
                     io_unlock_ro(sdpaBwd2[L]->ioOut);
                     }
                     io_read_fp16(kern[L].sdpaBwd1->ioOut, cap->dv[slot], 0, DIM, SEQ);
                     t1=mach_absolute_time(); t_bwd_io+=tb_ms(t1-t0);
-
-                    // RoPE backward: rotate dQ,dK back to pre-RoPE space for dW sgemm + qkvBwd
                     t0=mach_absolute_time();
                     cpu_rope_backward_cf(cap->dq[slot], cap->dk[slot], SEQ, HEADS, HD);
                     t1=mach_absolute_time(); t_bwd_io+=tb_ms(t1-t0);
+                    }
 
                     // dWq/dWk/dWv async (xnorm[slot] populated in forward, dq/dk are pre-RoPE)
                     dispatch_group_async(layer_dw_grp, dw_layer_q[L], ^{
@@ -815,10 +869,11 @@ int main(int argc, char *argv[]) {
                         dispatch_semaphore_signal(cap->sem);
                     });
 
-                    // QKV backward (ANE): un-RoPE'd dQ,dK from fp32 + dV from sdpaBwd1
+                    // QKV backward (ANE): un-RoPE'd dQ,dK + dV already in qkvBwd->ioIn
                     t0=mach_absolute_time();
-                    { // Batch: qkvBwd->ioIn (3 writes→1) + sdpaBwd1->ioOut (dV)
-                    _Float16 *qkv_in = io_lock_rw(kern[L].qkvBwd->ioIn);
+                    if (!gpu_rope) {
+                    // CPU path: write fp32 dQ,dK to qkvBwd->ioIn + copy dV
+                    { _Float16 *qkv_in = io_lock_rw(kern[L].qkvBwd->ioIn);
                     cvt_f32_f16(qkv_in,              cap->dq[slot], DIM * SEQ);
                     cvt_f32_f16(qkv_in + DIM*SEQ,    cap->dk[slot], DIM * SEQ);
                     const _Float16 *bwd1_p = io_lock_ro(kern[L].sdpaBwd1->ioOut);
@@ -826,6 +881,7 @@ int main(int argc, char *argv[]) {
                     io_unlock_ro(kern[L].sdpaBwd1->ioOut);
                     io_unlock_rw(kern[L].qkvBwd->ioIn);
                     }
+                    } // GPU path: qkvBwd->ioIn already fully populated above
                     t1=mach_absolute_time(); t_bwd_io+=tb_ms(t1-t0); t0=t1;
                     ane_eval(kern[L].qkvBwd);
                     t1=mach_absolute_time(); t_bwd_ane+=tb_ms(t1-t0); t0=t1;
