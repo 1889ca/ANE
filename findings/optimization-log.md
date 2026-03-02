@@ -362,20 +362,77 @@ Instrumentation added:
 
 ---
 
+## 11. ANE Softmax for Cross-Entropy
+
+**Commit:** `ff96d61` — "ANE softmax for cross-entropy"
+
+**What:** Added `gen_softmax()` MIL kernel that computes softmax on ANE, replacing the CPU `cross_entropy_loss` softmax. The kernel takes logits from `cls_fwd->ioOut` via `io_copy` (no CPU round-trip), computes `exp(x - max(x)) / sum(exp(x - max(x)))`, and writes probabilities back. CPU still handles loss accumulation and gradient (trivial: `probs/S`, subtract `1/S` at target positions).
+
+**Result:** xent dropped from ~15ms to ~4.6ms. Total step time: ~75→69ms (prior session).
+
+---
+
+## 12. Instrument Backward Pass Timing
+
+**Commit:** `f0b2479` — "Instrument backward pass timing — accounts for 98.5% of step time"
+
+**What:** The backward pass consumed ~65% of step time but was completely untimed. Added three new accumulators:
+- `t_bwd_ane` — all backward ANE evals (ffnBwd, sdpaBwd1, sdpaBwd2, qkvBwd, rmsBwd ×2 per layer + rmsBwdFinal)
+- `t_bwd_io` — all backward IO (io_copy, io_read_fp16, io_write_fp16_at, io_write_fp16_vec)
+- `t_cls_bwd` — classifier backward (ANE eval or CPU sgemm)
+
+Wrapped each backward ANE eval and IO block with `mach_absolute_time()` timing, same pattern as forward path. Fixed `final_dw_wait` label to divide by `steps_batch` (was showing per-batch value with "ms/step" label). Renamed forward timing line to `fwd:` for clarity.
+
+**Key discovery:** The `final_dw_wait` in previous sessions was **per-batch, not per-step**. For a 100-step batch, the actual per-step value is ~0.1ms — negligible. The dW tail is not inside the per-step timing loop (`tms` measured at line 726, before `dispatch_group_wait` at line 732).
+
+**Result (100 steps, accum=200):**
+```
+82.9 ms/step
+  fwd: ane=9.8 io=5.0 cls=1.0 rms_fwd=0.1 ms/step
+  bwd: ane=24.5 io=16.3 cls_bwd=13.6 ms/step
+  elem=11.4 [xent=4.7 memcpy=1.5 rms_bwd=2.5 resid=1.4 embed=0.9 embed_bwd=0.4]
+  dW sgemm: ffn=188.1 wo=21.8 qkv=64.3 embed=24.0 total=298.1 ms/step
+  sem_wait=0.0 final_dw_wait=0.1 ms/step
+```
+
+**Full step accounting:**
+
+| Component | ms/step | % of step |
+|---|---|---|
+| fwd ane | 9.8 | 11.8% |
+| fwd io | 5.0 | 6.0% |
+| fwd cls | 1.0 | 1.2% |
+| bwd ane | 24.5 | 29.6% |
+| bwd io | 16.3 | 19.7% |
+| cls_bwd | 13.6 | 16.4% |
+| elem (xent+memcpy+rms_bwd+resid+embed+embed_bwd) | 11.4 | 13.8% |
+| rms_fwd | 0.1 | 0.1% |
+| **Accounted** | **81.7** | **98.6%** |
+| **Measured** | **82.9** | |
+
+**Key findings:**
+1. **Backward ANE (24.5ms) is 2.5x forward ANE (9.8ms)** — 74 ANE evals vs 24 forward evals. Per-eval: ~0.33ms backward vs ~0.41ms forward. Backward kernels are actually slightly faster per-eval (smaller output tensors) but there are 3x more of them.
+2. **Backward IO (16.3ms) is 3.3x forward IO (5.0ms)** — backward shuffles far more data between ANE kernels (SDPA backward alone has 5 io_copy + 3 io_read_fp16 per layer).
+3. **cls_bwd (13.6ms) is the single most expensive ANE kernel** — VOCAB×DIM×SEQ = 32000×768×256 ≈ 12.6 GFLOPS matmul as a single conv op.
+
+---
+
 ## Remaining Optimization Targets
 
-Current profile (100 steps, accum=50, avg of 2 batches):
+Current profile (100 steps, accum=200):
 ```
-88.3 ms/step
-  ane=9.8  io=4.4  cls=1.8
-  elem=21.0 [xent=15.1 memcpy=1.2 rms_bwd=2.2 resid=1.3 embed=1.1 embed_bwd=0.3]
-  dW sgemm: ffn=178 wo=20 qkv=56 embed=21 total=276 ms/step (~3.1x overlap)
-  sem_wait=0.0 final_dw_wait=12.7 ms/step (once per 50-step batch)
+82.9 ms/step
+  fwd: ane=9.8 io=5.0 cls=1.0 rms_fwd=0.1   (16.9 total)
+  bwd: ane=24.5 io=16.3 cls_bwd=13.6          (54.4 total)
+  elem=11.4 [xent=4.7 memcpy=1.5 rms_bwd=2.5 resid=1.4 embed=0.9 embed_bwd=0.4]
+  dW sgemm: ffn=188 wo=22 qkv=64 embed=24 total=298 ms/step (~3.6x overlap)
+  sem_wait=0.0 final_dw_wait=0.1 ms/step
 ```
 
 ### Prioritized by risk-adjusted impact
 
-1. **xent ~15ms** — Fused cross-entropy on ANE (see hivemind analysis). **~15ms, high risk.** Research spike.
-2. **io ~4ms** — Keep activations in fp16 end-to-end. **~4ms, medium risk.**
-3. **Layer dW structure** — Tiling with dispatch_apply failed (thread explosion, see entry #10). Remaining options: consolidate to fewer queues, QoS tiers, or `VECLIB_MAXIMUM_THREADS` tuning. **Speculative.**
-4. **rms_bwd ~2ms, resid ~1.3ms, memcpy ~1.2ms** — Diminishing returns individually, ~4.5ms combined.
+1. **bwd io ~16ms** — Backward IO is the #1 target. The backward pass copies far more data than forward because SDPA backward uses 5 separate io_copy + 3 io_read per layer. Potential: fuse sdpaBwd1+sdpaBwd2 into a single kernel (eliminates inter-kernel IO), keep more data in IOSurface (eliminate fp16→fp32→fp16 round-trips). **~10ms potential, medium risk.**
+2. **cls_bwd ~14ms** — Single largest ANE kernel. Could split into tiled convolutions or restructure to reduce per-eval cost. **~5-8ms potential, medium risk.**
+3. **bwd ane ~24ms** — 74 ANE evals at ~0.33ms each. Main lever is kernel fusion to reduce eval count (e.g., fuse qkvBwd+rmsBwd into single kernel). **~5ms potential, high risk (MIL graph complexity).**
+4. **fwd io ~5ms** — Keep activations in fp16 end-to-end, eliminate unnecessary conversions. **~3ms potential, medium risk.**
+5. **elem ~11ms** — xent now 4.7ms (ANE softmax working). Remaining: memcpy 1.5, rms_bwd 2.5, resid 1.4. Diminishing returns individually.
