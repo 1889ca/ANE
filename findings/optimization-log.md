@@ -490,6 +490,49 @@ All within a single MIL program (single `ane_eval`). Weight blobs built from 4 s
 
 ---
 
+## 15. Cosine LR Schedule + 5000-Step Training Run
+
+**What:** Added cosine learning rate schedule with linear warmup:
+- `--lr` sets peak LR, `--lr-min` sets floor (enables cosine decay), `--warmup` sets warmup steps
+- LR computed at end of each accumulation batch (before adam update)
+- Formula: warmup phase uses linear ramp `lr * (step / warmup_steps)`, then `lr_min + 0.5 * (lr - lr_min) * (1 + cos(π * progress))` where `progress = (step - warmup) / (total - warmup)`
+
+**LR sensitivity experiments:**
+- `lr=1e-4, lr_min=1e-5, warmup=100`: Diverged by step 450 (loss hit 4.9, continued climbing to 6+)
+- `lr=5e-5, lr_min=5e-6, warmup=200`: Diverged by step 1500 (loss hit 5-6 range)
+- `lr=3e-5, lr_min=3e-6, warmup=100`: **Stable for full 5000 steps**
+
+**Key finding:** fp16 forward/backward on ANE constrains the max stable LR much more than a typical fp32 training setup. The fp16 gradient accumulation introduces noise that makes lr>3e-5 unstable for this model. This is consistent with the earlier finding that flat lr=3e-4 diverged at ~150 steps while lr=3e-5 was stable.
+
+**5000-step training result (lr=3e-5 → 3e-6, warmup=100, accum=50):**
+```
+Best loss: 2.91 (step 3950), final: ~4.2 (high per-step variance)
+Top-5 losses: 2.91, 2.94, 3.16, 3.19, 3.21
+Wall time: 22.2 min (1330s), ~133ms/step avg (includes recompile overhead)
+Efficiency: 1.31 TFLOPS sustained (ANE+CPU), 5.6% ANE utilization
+```
+
+**Text generation eval (generate.py):**
+Pretrained (no RoPE):
+```
+Greedy: "Once upon a time, there was a little girl named Lily. She was a little girl
+named Lily. She loved to play with her doll. She was a doll. She was very special
+doll. She was very special doll."
+```
+
+Trained (5000 steps, no RoPE):
+```
+Greedy: "Once upon a time, there was a little girl named Lily. Lily loved to play
+outside in the park with her friends. She loved to run and jump on the swim in the
+swim in the swim in the pond."
+```
+
+Both produce coherent children's story fragments. The trained model shows slightly better narrative structure (character motivation, events) but still degrades mid-sequence due to the no-RoPE limitation. The improvement from pretrained to trained is modest — the primary bottleneck for generation quality is positional encoding, not training duration.
+
+**Files changed:** `train_large.m` (cosine LR schedule, --lr-min/--warmup flags), `generate.py` (new: text generation eval matching ANE training kernels)
+
+---
+
 ## Remaining Optimization Targets
 
 Current profile (20 steps, accum=50, post tiled cls_bwd):

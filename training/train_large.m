@@ -198,7 +198,8 @@ int main(int argc, char *argv[]) {
         mach_timebase_info(&g_tb);
 
         int total_steps = 10000;
-        float lr = 3e-4f;
+        float lr = 3e-4f, lr_min = 0.0f;
+        int warmup_steps = 0;
         float adam_b1=0.9f, adam_b2=0.999f, adam_eps=1e-8f;
         int adam_t = 0, start_step = 0;
         int accum_steps = DEFAULT_ACCUM_STEPS;
@@ -211,6 +212,8 @@ int main(int argc, char *argv[]) {
             else if (strcmp(argv[i], "--steps") == 0 && i+1<argc) total_steps = atoi(argv[++i]);
             else if (strcmp(argv[i], "--lr") == 0 && i+1<argc) lr = atof(argv[++i]);
             else if (strcmp(argv[i], "--accum") == 0 && i+1<argc) accum_steps = atoi(argv[++i]);
+            else if (strcmp(argv[i], "--lr-min") == 0 && i+1<argc) lr_min = atof(argv[++i]);
+            else if (strcmp(argv[i], "--warmup") == 0 && i+1<argc) warmup_steps = atoi(argv[++i]);
             else if (strcmp(argv[i], "--max-compiles") == 0 && i+1<argc) max_compiles = atoi(argv[++i]);
         }
 
@@ -283,7 +286,10 @@ int main(int argc, char *argv[]) {
             printf("Params: %.2fM (transformer %.2fM + embed %.2fM)\n", tp/1e6, xfmr_params/1e6, embed_params/1e6);
             printf("Kernels: %d (%d weight-bearing + %d static sdpaBwd2)\n",
                    TOTAL_WEIGHT_KERNELS+NLAYERS, TOTAL_WEIGHT_KERNELS, NLAYERS);
-            printf("Accum %d steps per recompile | Adam LR=%.1e b1=%.1f b2=%.3f\n", accum_steps, lr, adam_b1, adam_b2);
+            printf("Accum %d steps per recompile | Adam LR=%.1e", accum_steps, lr);
+            if (warmup_steps > 0) printf(" warmup=%d", warmup_steps);
+            if (lr_min > 0) printf(" lr_min=%.1e (cosine)", lr_min);
+            printf(" b1=%.1f b2=%.3f\n", adam_b1, adam_b2);
             double fwd_f = NLAYERS*(4.0*2*DIM*DIM*SEQ + 2.0*2*DIM*HIDDEN*SEQ + 2.0*HIDDEN*DIM*SEQ);
             double bwd_dx_f = fwd_f, bwd_dw_f = fwd_f;
             double sdpa_f = NLAYERS*2.0*HEADS*5*SEQ*SEQ*HD;
@@ -833,6 +839,15 @@ int main(int argc, char *argv[]) {
             dispatch_group_wait(embed_dw_grp, DISPATCH_TIME_FOREVER);
             double t_final_dw_wait = tb_ms(mach_absolute_time()-tw0);
 
+            // Cosine LR schedule with optional warmup (use end-of-batch step)
+            float cur_lr = lr;
+            if (warmup_steps > 0 && step <= warmup_steps) {
+                cur_lr = lr * ((float)step / warmup_steps);
+            } else if (lr_min > 0) {
+                float progress = (float)(step - warmup_steps) / fmaxf(1.0f, (float)(total_steps - warmup_steps));
+                cur_lr = lr_min + 0.5f * (lr - lr_min) * (1.0f + cosf(M_PI * progress));
+            }
+
             // Adam update (scale gradients by 1/steps_batch)
             float gsc = 1.0f / steps_batch;
             adam_t++;
@@ -844,24 +859,24 @@ int main(int argc, char *argv[]) {
                 for(size_t i=0;i<W3_SZ;i++) g->W3[i]*=gsc;
                 for(int i=0;i<DIM;i++){g->rms_att[i]*=gsc; g->rms_ffn[i]*=gsc;}
 
-                adam_update(lw[L].Wq, g->Wq, &la[L].Wq, adam_t, lr, adam_b1, adam_b2, adam_eps);
-                adam_update(lw[L].Wk, g->Wk, &la[L].Wk, adam_t, lr, adam_b1, adam_b2, adam_eps);
-                adam_update(lw[L].Wv, g->Wv, &la[L].Wv, adam_t, lr, adam_b1, adam_b2, adam_eps);
-                adam_update(lw[L].Wo, g->Wo, &la[L].Wo, adam_t, lr, adam_b1, adam_b2, adam_eps);
-                adam_update(lw[L].W1, g->W1, &la[L].W1, adam_t, lr, adam_b1, adam_b2, adam_eps);
-                adam_update(lw[L].W2, g->W2, &la[L].W2, adam_t, lr, adam_b1, adam_b2, adam_eps);
-                adam_update(lw[L].W3, g->W3, &la[L].W3, adam_t, lr, adam_b1, adam_b2, adam_eps);
-                adam_update(lw[L].rms_att, g->rms_att, &la[L].rms_att, adam_t, lr, adam_b1, adam_b2, adam_eps);
-                adam_update(lw[L].rms_ffn, g->rms_ffn, &la[L].rms_ffn, adam_t, lr, adam_b1, adam_b2, adam_eps);
+                adam_update(lw[L].Wq, g->Wq, &la[L].Wq, adam_t, cur_lr, adam_b1, adam_b2, adam_eps);
+                adam_update(lw[L].Wk, g->Wk, &la[L].Wk, adam_t, cur_lr, adam_b1, adam_b2, adam_eps);
+                adam_update(lw[L].Wv, g->Wv, &la[L].Wv, adam_t, cur_lr, adam_b1, adam_b2, adam_eps);
+                adam_update(lw[L].Wo, g->Wo, &la[L].Wo, adam_t, cur_lr, adam_b1, adam_b2, adam_eps);
+                adam_update(lw[L].W1, g->W1, &la[L].W1, adam_t, cur_lr, adam_b1, adam_b2, adam_eps);
+                adam_update(lw[L].W2, g->W2, &la[L].W2, adam_t, cur_lr, adam_b1, adam_b2, adam_eps);
+                adam_update(lw[L].W3, g->W3, &la[L].W3, adam_t, cur_lr, adam_b1, adam_b2, adam_eps);
+                adam_update(lw[L].rms_att, g->rms_att, &la[L].rms_att, adam_t, cur_lr, adam_b1, adam_b2, adam_eps);
+                adam_update(lw[L].rms_ffn, g->rms_ffn, &la[L].rms_ffn, adam_t, cur_lr, adam_b1, adam_b2, adam_eps);
             }
             for(int i=0;i<DIM;i++) grms_final[i]*=gsc;
-            adam_update(rms_final, grms_final, &arms_final, adam_t, lr, adam_b1, adam_b2, adam_eps);
+            adam_update(rms_final, grms_final, &arms_final, adam_t, cur_lr, adam_b1, adam_b2, adam_eps);
             // Merge embed accumulators (cls dense + emb scatter), scale, and update
             for(size_t i=0;i<(size_t)VOCAB*DIM;i++) gembed_cls[i] = (gembed_cls[i] + gembed_emb[i]) * gsc;
-            adam_update(embed, gembed_cls, &aembed, adam_t, lr, adam_b1, adam_b2, adam_eps);
+            adam_update(embed, gembed_cls, &aembed, adam_t, cur_lr, adam_b1, adam_b2, adam_eps);
 
-            printf("  [batch %d: compile=%.0fms train=%.1fms (%.1fms/step) compiles=%d]\n",
-                   steps_batch, cms, tms, tms/steps_batch, g_compile_count);
+            printf("  [batch %d: compile=%.0fms train=%.1fms (%.1fms/step) compiles=%d lr=%.2e]\n",
+                   steps_batch, cms, tms, tms/steps_batch, g_compile_count, cur_lr);
             double t_elem_total = t_embed+t_resid+t_xent+t_memcpy+t_rms_bwd+t_embed_bwd;
             printf("    fwd: ane=%.1f io=%.1f cls=%.1f rms_fwd=%.1f ms/step\n",
                    t_ane/steps_batch, t_io/steps_batch, t_cls/steps_batch,
