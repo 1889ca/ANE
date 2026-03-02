@@ -434,13 +434,18 @@ int main(int argc, char *argv[]) {
             }
 
             // Compile classifier ANE kernels (embed weights change each batch)
+            // cls_bwd uses tiled 4×8K convs to avoid ANE pathology with 32K input channels
             if (use_ane_cls) {
                 free_kern(cls_fwd); free_kern(cls_bwd);
                 cls_fwd = compile_kern_mil_w(gen_cls_fwd(), (@{
                     @"@model_path/weights/embed.bin": @{@"offset":@0, @"data":build_blob(embed, VOCAB, DIM)},
                 }), DIM*SEQ*2, VOCAB*SEQ*2);
-                cls_bwd = compile_kern_mil_w(gen_cls_bwd(), (@{
-                    @"@model_path/weights/embed_t.bin": @{@"offset":@0, @"data":build_blob_t(embed, VOCAB, DIM)},
+                int chunk = VOCAB / 4;
+                cls_bwd = compile_kern_mil_w(gen_cls_bwd_tiled(), (@{
+                    @"@model_path/weights/wt0.bin": @{@"offset":@0, @"data":build_blob_t(embed + (size_t)0*chunk*DIM, chunk, DIM)},
+                    @"@model_path/weights/wt1.bin": @{@"offset":@0, @"data":build_blob_t(embed + (size_t)1*chunk*DIM, chunk, DIM)},
+                    @"@model_path/weights/wt2.bin": @{@"offset":@0, @"data":build_blob_t(embed + (size_t)2*chunk*DIM, chunk, DIM)},
+                    @"@model_path/weights/wt3.bin": @{@"offset":@0, @"data":build_blob_t(embed + (size_t)3*chunk*DIM, chunk, DIM)},
                 }), VOCAB*SEQ*2, DIM*SEQ*2);
                 if (!cls_fwd || !cls_bwd) {
                     printf("  [cls] ANE compile failed (VOCAB=%d may exceed channel limit), falling back to CPU\n", VOCAB);
@@ -575,7 +580,8 @@ int main(int argc, char *argv[]) {
                 // ===== BACKWARD =====
                 // Classifier backward: dx_final = embed^T @ dlogits
                 t0=mach_absolute_time();
-                if (use_ane_cls) {
+                if (cls_bwd) {
+                    // ANE cls_bwd (mode 0: original, mode 1: tiled)
                     io_write_fp16(cls_bwd->ioIn, dlogits, VOCAB, SEQ);
                     t1=mach_absolute_time(); t_bwd_io+=tb_ms(t1-t0); t0=t1;
                     ane_eval(cls_bwd);
@@ -583,6 +589,7 @@ int main(int argc, char *argv[]) {
                     io_read_fp16(cls_bwd->ioOut, dy, 0, DIM, SEQ);
                     t1=mach_absolute_time(); t_bwd_io+=tb_ms(t1-t0);
                 } else {
+                    // CPU cls_bwd (mode 2 or ANE fallback)
                     cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
                                 DIM, SEQ, VOCAB, 1.0f,
                                 embed, DIM, dlogits, SEQ, 0.0f, dy, SEQ);
@@ -612,7 +619,7 @@ int main(int argc, char *argv[]) {
                 t0=mach_absolute_time();
                 rmsnorm_dw(grms_final, dy, x_cur, rrms_final, DIM, SEQ);
                 t1=mach_absolute_time(); t_rms_bwd+=tb_ms(t1-t0); t0=t1;
-                if (use_ane_cls)
+                if (cls_bwd)
                     io_copy(rmsBwdFinal->ioIn, 0, cls_bwd->ioOut, 0, DIM, SEQ);
                 else
                     io_write_fp16_at(rmsBwdFinal->ioIn, 0, dy, DIM, SEQ);

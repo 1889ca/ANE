@@ -286,14 +286,30 @@ static NSString *gen_cls_fwd(void) {
     return m;
 }
 
-// Classifier backward dx: dlogits → dy via transposed embed conv
-static NSString *gen_cls_bwd(void) {
+// Classifier backward dx (tiled): dlogits → dy via 4 × sliced transposed embed convs
+// Splits 32K input channels into 4×8K to avoid ANE pathology with large channel counts
+static NSString *gen_cls_bwd_tiled(void) {
+    int T = 4, chunk = VOCAB / T;
     NSMutableString *m = [NSMutableString string];
     [m appendString:MIL_HDR];
     [m appendFormat:@"    func main<ios18>(tensor<fp16, [1, %d, 1, %d]> x) {\n", VOCAB, SEQ];
     [m appendString:@CONV_CONST];
-    [m appendFormat:@"        tensor<fp16, [%d,%d,1,1]> Wet = const()[name=string(\"Wet\"), val=tensor<fp16, [%d,%d,1,1]>(BLOBFILE(path=string(\"@model_path/weights/embed_t.bin\"), offset=uint64(64)))];\n", DIM,VOCAB,DIM,VOCAB];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> out = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wet,x=x)[name=string(\"cls_bwd\")];\n", DIM,SEQ];
+    // 4 weight constants (each [DIM, chunk, 1, 1])
+    for (int t = 0; t < T; t++)
+        [m appendFormat:@"        tensor<fp16, [%d,%d,1,1]> W%d = const()[name=string(\"W%d\"), val=tensor<fp16, [%d,%d,1,1]>(BLOBFILE(path=string(\"@model_path/weights/wt%d.bin\"), offset=uint64(64)))];\n",
+            DIM, chunk, t, t, DIM, chunk, t];
+    // Slice size (shared across all 4 slices)
+    [m appendFormat:@"        tensor<int32, [4]> sz = const()[name=string(\"sz\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", chunk, SEQ];
+    // Slice input into 4 chunks, conv each
+    for (int t = 0; t < T; t++) {
+        [m appendFormat:@"        tensor<int32, [4]> b%d = const()[name=string(\"b%d\"), val=tensor<int32, [4]>([0,%d,0,0])];\n", t, t, t*chunk];
+        [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> s%d = slice_by_size(x=x,begin=b%d,size=sz)[name=string(\"s%d\")];\n", chunk, SEQ, t, t, t];
+        [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> c%d = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=W%d,x=s%d)[name=string(\"c%d\")];\n", DIM, SEQ, t, t, t, t];
+    }
+    // Pairwise add tree: (c0+c1) + (c2+c3)
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> a01 = add(x=c0,y=c1)[name=string(\"a01\")];\n", DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> a23 = add(x=c2,y=c3)[name=string(\"a23\")];\n", DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> out = add(x=a01,y=a23)[name=string(\"out\")];\n", DIM, SEQ];
     [m appendString:@"    } -> (out);\n}\n"];
     return m;
 }
