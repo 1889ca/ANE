@@ -336,18 +336,17 @@ Instrumentation added:
 
 **Result (100 steps, accum=50):**
 ```
-92.3 ms/step (avg), batch1=89.5, batch2=95.1
-  ane=9.6  io=4.9  cls=2.1
-  elem=21.7 [xent=15.1 memcpy=1.3 rms_bwd=2.3 resid=1.7 embed=1.1 embed_bwd=0.3]
-  dW sgemm: ffn=183 wo=20 qkv=58 embed=20 total=281 ms/step
-  sem_wait=0.0 final_dw_wait=10.8 ms/step
+88.3 ms/step (avg), batch1=88.0, batch2=88.5
+  ane=9.8  io=4.4  cls=1.8
+  elem=21.0 [xent=15.1 memcpy=1.2 rms_bwd=2.2 resid=1.3 embed=1.1 embed_bwd=0.3]
+  dW sgemm: ffn=178 wo=20 qkv=56 embed=21 total=276 ms/step
+  sem_wait=0.0 final_dw_wait=12.7 ms/step
 ```
 
 | Metric | Before | After | Change |
 |---|---|---|---|
-| ms/step (100-step avg) | 101.5 | 92.3 | **-9.2ms (9.1%)** |
-| ms/step (warm batch) | 100.7 | 95.1 | **-5.6ms** |
-| embed sgemm | 52 | 20 | **-32ms (-61%)** |
+| ms/step (100-step avg) | 101.5 | 88.3 | **-13.2ms (13.0%)** |
+| embed sgemm | 52 | 21 | **-31ms (-60%)** |
 | embed_dw_wait | 11 | 0 (eliminated) | **-11ms** |
 
 **Key findings:**
@@ -359,22 +358,24 @@ Instrumentation added:
 
 **Correctness:** Loss unchanged (step 0: 4.3143, step 10: 3.6053, step 90: 3.7848).
 
+**Failed experiment — layer dW tiling:** Applied the same `dispatch_apply` tiling to FFN/Wo/QKV dW blocks (4-8 tiles each). Result: **regression** to 104.9ms/step. Root cause: 12 serial queues already provide inter-layer parallelism. Adding intra-block tiling spawns 36 × 4-8 = 150+ threads on the global concurrent queue, causing thread explosion that steals CPU from main-thread work (xent jumped 15→24ms). Lesson: `dispatch_apply` tiling works for a single large sequential sgemm (embed) but not for many concurrent small sgemms (layer dW).
+
 ---
 
 ## Remaining Optimization Targets
 
 Current profile (100 steps, accum=50, avg of 2 batches):
 ```
-92.3 ms/step
-  ane=9.6  io=4.9  cls=2.1
-  elem=21.7 [xent=15.1 memcpy=1.3 rms_bwd=2.3 resid=1.7 embed=1.1 embed_bwd=0.3]
-  dW sgemm: ffn=183 wo=20 qkv=58 embed=20 total=281 ms/step (~3.0x overlap)
-  sem_wait=0.0 final_dw_wait=10.8 ms/step (once per 50-step batch)
+88.3 ms/step
+  ane=9.8  io=4.4  cls=1.8
+  elem=21.0 [xent=15.1 memcpy=1.2 rms_bwd=2.2 resid=1.3 embed=1.1 embed_bwd=0.3]
+  dW sgemm: ffn=178 wo=20 qkv=56 embed=21 total=276 ms/step (~3.1x overlap)
+  sem_wait=0.0 final_dw_wait=12.7 ms/step (once per 50-step batch)
 ```
 
 ### Prioritized by risk-adjusted impact
 
 1. **xent ~15ms** — Fused cross-entropy on ANE (see hivemind analysis). **~15ms, high risk.** Research spike.
-2. **io ~5ms** — Keep activations in fp16 end-to-end. **~5ms, medium risk.**
-3. **Layer dW structure** — Consolidate 12 serial queues, use QoS tiers, or tile layer sgemms with dispatch_apply (proven effective for embed). FFN dW at 183ms is the biggest chunk. **Speculative, needs experimentation.**
-4. **rms_bwd ~2ms, resid ~1.7ms, memcpy ~1.3ms** — Diminishing returns individually, ~5ms combined.
+2. **io ~4ms** — Keep activations in fp16 end-to-end. **~4ms, medium risk.**
+3. **Layer dW structure** — Tiling with dispatch_apply failed (thread explosion, see entry #10). Remaining options: consolidate to fewer queues, QoS tiers, or `VECLIB_MAXIMUM_THREADS` tuning. **Speculative.**
+4. **rms_bwd ~2ms, resid ~1.3ms, memcpy ~1.2ms** — Diminishing returns individually, ~4.5ms combined.
