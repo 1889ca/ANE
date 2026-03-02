@@ -67,7 +67,7 @@ static NSString *gen_sdpa_fwd_taps(void) {
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> x2 = add(x=x,y=oo)[name=string(\"res\")];\n", DIM,SEQ];
     [m appendString:@"        int32 cax = const()[name=string(\"cax\"), val=int32(1)];\n"];
     [m appendString:@"        bool cid = const()[name=string(\"cid\"), val=bool(false)];\n"];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> out = concat(axis=cax,interleave=cid,values=(x2,qf,kf,vf,af,xn))[name=string(\"cat\")];\n", 6*DIM,SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> out = concat(axis=cax,interleave=cid,values=(x2,qf,kf,vf,af,xn,rrms))[name=string(\"cat\")];\n", 6*DIM+1,SEQ];
     [m appendString:@"    } -> (out);\n}\n"];
     return m;
 }
@@ -104,7 +104,7 @@ static NSString *gen_ffn_fwd_taps(void) {
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> xnext = add(x=x,y=y)[name=string(\"res\")];\n", DIM,SEQ];
     [m appendString:@"        int32 cax = const()[name=string(\"cax\"), val=int32(1)];\n"];
     [m appendString:@"        bool cid = const()[name=string(\"cid\"), val=bool(false)];\n"];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> out = concat(axis=cax,interleave=cid,values=(xnext,h1,h3,gate,xn))[name=string(\"cat\")];\n", 2*DIM+3*HIDDEN,SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> out = concat(axis=cax,interleave=cid,values=(xnext,h1,h3,gate,xn,rrms))[name=string(\"cat\")];\n", 2*DIM+3*HIDDEN+1,SEQ];
     [m appendString:@"    } -> (out);\n}\n"];
     return m;
 }

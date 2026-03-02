@@ -64,14 +64,14 @@ static bool compile_layer_kernels(LayerKernels *lk, LayerWeights *w) {
         @"@model_path/weights/wv.bin": @{@"offset":@0, @"data":build_blob(w->Wv,DIM,DIM)},
         @"@model_path/weights/wo.bin": @{@"offset":@0, @"data":build_blob(w->Wo,DIM,DIM)},
         @"@model_path/weights/mask.bin": @{@"offset":@0, @"data":get_mask_blob()},
-    }), DIM*SEQ*2, 6*DIM*SEQ*2);
+    }), DIM*SEQ*2, (6*DIM+1)*SEQ*2);
 
     lk->fwdFFN = compile_kern_mil_w(gen_ffn_fwd_taps(), (@{
         @"@model_path/weights/rms2.bin": @{@"offset":@0, @"data":build_blob(w->rms_ffn,1,DIM)},
         @"@model_path/weights/w1.bin": @{@"offset":@0, @"data":build_blob(w->W1,HIDDEN,DIM)},
         @"@model_path/weights/w3.bin": @{@"offset":@0, @"data":build_blob(w->W3,HIDDEN,DIM)},
         @"@model_path/weights/w2.bin": @{@"offset":@0, @"data":build_blob(w->W2,DIM,HIDDEN)},
-    }), DIM*SEQ*2, (2*DIM+3*HIDDEN)*SEQ*2);
+    }), DIM*SEQ*2, (2*DIM+3*HIDDEN+1)*SEQ*2);
 
     lk->ffnBwd = compile_kern_mil_w(gen_ffn_bwd(), (@{
         @"@model_path/weights/w2t.bin": @{@"offset":@0, @"data":build_blob_t(w->W2,DIM,HIDDEN)},
@@ -232,6 +232,7 @@ int main(int argc, char *argv[]) {
 
         // Final RMSNorm + embedding + classifier
         float *rms_final = (float*)malloc(DIM*4);
+        float *rrms_final = (float*)malloc(SEQ*4);
         float *embed = (float*)malloc(VOCAB*DIM*4);  // [VOCAB, DIM] row-major
         float *grms_final = (float*)calloc(DIM, 4);
         float *gembed = (float*)calloc(VOCAB*DIM, 4);
@@ -477,6 +478,7 @@ int main(int argc, char *argv[]) {
                     io_read_fp16(kern[L].fwdAttn->ioOut, ac->x2,                  0,     DIM, SEQ);
                     io_read_fp16(kern[L].fwdAttn->ioOut, dwcap[L].attn_out[slot], 4*DIM, DIM, SEQ);
                     io_read_fp16(kern[L].fwdAttn->ioOut, dwcap[L].xnorm[slot],    5*DIM, DIM, SEQ);
+                    io_read_fp16(kern[L].fwdAttn->ioOut, ac->rrms_att,           6*DIM, 1,   SEQ);
                     t1=mach_absolute_time(); t_io+=tb_ms(t1-t0); t0=t1;
 
                     // FFN forward (x2 already piped via io_copy)
@@ -487,13 +489,14 @@ int main(int argc, char *argv[]) {
                     io_read_fp16(kern[L].fwdFFN->ioOut, ac->h1,                  DIM,          HIDDEN, SEQ);
                     io_read_fp16(kern[L].fwdFFN->ioOut, ac->h3,                  DIM+HIDDEN,   HIDDEN, SEQ);
                     io_read_fp16(kern[L].fwdFFN->ioOut, dwcap[L].silu_out[slot], DIM+2*HIDDEN, HIDDEN, SEQ);
-                    io_read_fp16(kern[L].fwdFFN->ioOut, dwcap[L].x2norm[slot],   DIM+3*HIDDEN, DIM,   SEQ);
+                    io_read_fp16(kern[L].fwdFFN->ioOut, dwcap[L].x2norm[slot],   DIM+3*HIDDEN, DIM,    SEQ);
+                    io_read_fp16(kern[L].fwdFFN->ioOut, ac->rrms_ffn,          2*DIM+3*HIDDEN, 1, SEQ);
                     t1=mach_absolute_time(); t_io+=tb_ms(t1-t0);
                 }
 
                 // Final RMSNorm (CPU)
                 t0=mach_absolute_time();
-                rmsnorm(x_final, x_cur, rms_final, DIM, SEQ);
+                rmsnorm(x_final, x_cur, rms_final, rrms_final, DIM, SEQ);
                 t1=mach_absolute_time(); t_rms+=tb_ms(t1-t0); t0=t1;
 
                 // Classifier: logits = embed @ x_final
@@ -542,7 +545,7 @@ int main(int argc, char *argv[]) {
 
                 // Final RMSNorm backward: dw on CPU, dx on ANE
                 t0=mach_absolute_time();
-                rmsnorm_dw(grms_final, dy, x_cur, rms_final, DIM, SEQ);
+                rmsnorm_dw(grms_final, dy, x_cur, rrms_final, DIM, SEQ);
                 t1=mach_absolute_time(); t_rms_bwd+=tb_ms(t1-t0);
                 if (use_ane_cls)
                     io_copy(rmsBwdFinal->ioIn, 0, cls_bwd->ioOut, 0, DIM, SEQ);
@@ -587,7 +590,7 @@ int main(int argc, char *argv[]) {
 
                     // RMSNorm2 backward: dw on CPU, dx on ANE
                     t0=mach_absolute_time();
-                    rmsnorm_dw(gr->rms_ffn, dx_ffn, ac->x2, lw[L].rms_ffn, DIM, SEQ);
+                    rmsnorm_dw(gr->rms_ffn, dx_ffn, ac->x2, ac->rrms_ffn, DIM, SEQ);
                     t1=mach_absolute_time(); t_rms_bwd+=tb_ms(t1-t0);
                     io_copy(kern[L].rmsBwd->ioIn, 0,   kern[L].ffnBwd->ioOut, 0, DIM, SEQ);
                     io_copy(kern[L].rmsBwd->ioIn, DIM, kern[L].fwdFFN->ioIn, 0, DIM, SEQ);
@@ -639,7 +642,7 @@ int main(int argc, char *argv[]) {
 
                     // RMSNorm1 backward: dw on CPU (while fp32 dy is in dx_attn), dx on ANE
                     t0=mach_absolute_time();
-                    rmsnorm_dw(gr->rms_att, dx_attn, ac->layer_in, lw[L].rms_att, DIM, SEQ);
+                    rmsnorm_dw(gr->rms_att, dx_attn, ac->layer_in, ac->rrms_att, DIM, SEQ);
                     t1=mach_absolute_time(); t_rms_bwd+=tb_ms(t1-t0);
                     io_copy(kern[L].rmsBwd->ioIn, 0,   kern[L].qkvBwd->ioOut, 0, DIM, SEQ);
                     io_copy(kern[L].rmsBwd->ioIn, DIM, kern[L].fwdAttn->ioIn, 0, DIM, SEQ);
@@ -746,7 +749,7 @@ int main(int argc, char *argv[]) {
         }
         munmap(token_data, data_len);
         close(data_fd);
-        free(rms_final); free(embed); free(grms_final); free(gembed);
+        free(rms_final); free(rrms_final); free(embed); free(grms_final); free(gembed);
         adam_free(&arms_final); adam_free(&aembed);
         free(dy); free(dx_ffn); free(dx2); free(dx_attn);
         free(x_cur); free(x_final); free(logits); free(dlogits);

@@ -71,6 +71,8 @@ typedef struct {
     float *Q, *K, *V;  // [DIM, SEQ] QKV projections
     float *x2;          // [DIM, SEQ] residual after attn (fused on ANE)
     float *h1, *h3;     // [HIDDEN, SEQ] FFN intermediates
+    float *rrms_att;    // [SEQ] cached rrms from rmsnorm1 (for dw)
+    float *rrms_ffn;    // [SEQ] cached rrms from rmsnorm2 (for dw)
 } LayerActs;
 
 // Double-buffered dW capture slots (eliminates malloc+memcpy per step)
@@ -173,12 +175,14 @@ static LayerActs layer_acts_alloc(void) {
     a.K=(float*)malloc(SEQ*DIM*4); a.V=(float*)malloc(SEQ*DIM*4);
     a.x2=(float*)malloc(SEQ*DIM*4);
     a.h1=(float*)malloc(SEQ*HIDDEN*4); a.h3=(float*)malloc(SEQ*HIDDEN*4);
+    a.rrms_att=(float*)malloc(SEQ*4); a.rrms_ffn=(float*)malloc(SEQ*4);
     return a;
 }
 static void layer_acts_free(LayerActs *a) {
     free(a->layer_in);free(a->Q);free(a->K);free(a->V);
     free(a->x2);
     free(a->h1);free(a->h3);
+    free(a->rrms_att);free(a->rrms_ffn);
 }
 static LayerDWCap layer_dwcap_alloc(void) {
     LayerDWCap c;
