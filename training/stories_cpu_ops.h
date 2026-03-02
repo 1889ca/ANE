@@ -1,6 +1,7 @@
-// stories_cpu_ops.h — CPU operations: RMSNorm, cross-entropy, Adam, softmax
+// stories_cpu_ops.h — CPU operations: RMSNorm, cross-entropy, Adam, RoPE
 #pragma once
 #include "stories_config.h"
+#include <arm_neon.h>
 
 static float *g_rms_tmp = NULL;
 static float *g_rms_ss = NULL;
@@ -117,6 +118,122 @@ static void cpu_rope_backward_cf(float *dq, float *dk, int S, int n_heads, int h
                 float dk0 = dk[row0 + t], dk1 = dk[row1 + t];
                 dk[row0 + t] =  dk0 * cos_v + dk1 * sin_v;
                 dk[row1 + t] = -dk0 * sin_v + dk1 * cos_v;
+            }
+        }
+    }
+}
+
+// Precomputed cos/sin table for RoPE: [HD/2][SEQ][2] as fp16
+// Table layout: for dim pair j and position t, cos at (j*SEQ+t)*2, sin at (j*SEQ+t)*2+1
+// Same frequencies as cpu_rope_cf: freq_j = 1/10000^(2j/HD)
+static _Float16 *g_rope_table = NULL;
+
+static void rope_init_table(void) {
+    if (g_rope_table) return;
+    int half_hd = HD / 2;
+    g_rope_table = (_Float16*)malloc(half_hd * SEQ * 2 * sizeof(_Float16));
+    for (int j = 0; j < half_hd; j++) {
+        float freq = 1.0f / powf(10000.0f, (float)(2 * j) / HD);
+        for (int t = 0; t < SEQ; t++) {
+            float angle = t * freq;
+            g_rope_table[(j * SEQ + t) * 2]     = (_Float16)cosf(angle);
+            g_rope_table[(j * SEQ + t) * 2 + 1] = (_Float16)sinf(angle);
+        }
+    }
+}
+
+// NEON fp16 RoPE forward: fp16 src → fp16 dst, no format conversion
+// src/dst are raw IOSurface base pointers, offsets in fp16 elements
+// Rotation: (cos, -sin; sin, cos) applied to each (row0, row1) pair
+static void neon_rope_fwd_f16(const _Float16 *src, _Float16 *dst,
+                               int src_q_off, int src_k_off,
+                               int dst_q_off, int dst_k_off) {
+    const _Float16 *qs = src + src_q_off, *ks = src + src_k_off;
+    _Float16 *qd = dst + dst_q_off, *kd = dst + dst_k_off;
+    for (int h = 0; h < HEADS; h++) {
+        for (int j = 0; j < HD/2; j++) {
+            int row0 = (h * HD + 2*j) * SEQ;
+            int row1 = (h * HD + 2*j + 1) * SEQ;
+            const _Float16 *tbl = g_rope_table + j * SEQ * 2;
+            int t = 0;
+            for (; t + 7 < SEQ; t += 8) {
+                // Load interleaved [cos,sin,cos,sin,...] → deinterleave
+                float16x8x2_t cs = vld2q_f16((const __fp16*)(tbl + t*2));
+                float16x8_t cv = cs.val[0], sv = cs.val[1];
+                // Q rotation
+                float16x8_t q0 = vld1q_f16((const __fp16*)(qs + row0 + t));
+                float16x8_t q1 = vld1q_f16((const __fp16*)(qs + row1 + t));
+                vst1q_f16((__fp16*)(qd + row0 + t), vfmsq_f16(vmulq_f16(q0, cv), q1, sv));
+                vst1q_f16((__fp16*)(qd + row1 + t), vfmaq_f16(vmulq_f16(q0, sv), q1, cv));
+                // K rotation
+                float16x8_t k0 = vld1q_f16((const __fp16*)(ks + row0 + t));
+                float16x8_t k1 = vld1q_f16((const __fp16*)(ks + row1 + t));
+                vst1q_f16((__fp16*)(kd + row0 + t), vfmsq_f16(vmulq_f16(k0, cv), k1, sv));
+                vst1q_f16((__fp16*)(kd + row1 + t), vfmaq_f16(vmulq_f16(k0, sv), k1, cv));
+            }
+            for (; t < SEQ; t++) {
+                _Float16 cv = tbl[t*2], sv = tbl[t*2+1];
+                _Float16 q0v = qs[row0+t], q1v = qs[row1+t];
+                qd[row0+t] = q0v*cv - q1v*sv; qd[row1+t] = q0v*sv + q1v*cv;
+                _Float16 k0v = ks[row0+t], k1v = ks[row1+t];
+                kd[row0+t] = k0v*cv - k1v*sv; kd[row1+t] = k0v*sv + k1v*cv;
+            }
+        }
+    }
+}
+
+// NEON fp16 RoPE backward: fp16 src → fp16 dst + fp32 output for dW sgemm
+// Inverse rotation: (cos, +sin; -sin, cos)
+// Writes rotated fp16 to dst (for qkvBwd ANE) and converts to fp32 (for dW)
+static void neon_rope_bwd_f16(const _Float16 *src, _Float16 *dst,
+                               float *fp32_dq, float *fp32_dk,
+                               int src_q_off, int src_k_off,
+                               int dst_q_off, int dst_k_off) {
+    const _Float16 *dqs = src + src_q_off, *dks = src + src_k_off;
+    _Float16 *dqd = dst + dst_q_off, *dkd = dst + dst_k_off;
+    for (int h = 0; h < HEADS; h++) {
+        for (int j = 0; j < HD/2; j++) {
+            int row0 = (h * HD + 2*j) * SEQ;
+            int row1 = (h * HD + 2*j + 1) * SEQ;
+            const _Float16 *tbl = g_rope_table + j * SEQ * 2;
+            int t = 0;
+            for (; t + 7 < SEQ; t += 8) {
+                float16x8x2_t cs = vld2q_f16((const __fp16*)(tbl + t*2));
+                float16x8_t cv = cs.val[0], sv = cs.val[1];
+                // Inverse dQ rotation: (dq0*cos + dq1*sin, -dq0*sin + dq1*cos)
+                float16x8_t dq0 = vld1q_f16((const __fp16*)(dqs + row0 + t));
+                float16x8_t dq1 = vld1q_f16((const __fp16*)(dqs + row1 + t));
+                float16x8_t rq0 = vfmaq_f16(vmulq_f16(dq0, cv), dq1, sv);
+                float16x8_t rq1 = vfmsq_f16(vmulq_f16(dq1, cv), dq0, sv);
+                vst1q_f16((__fp16*)(dqd + row0 + t), rq0);
+                vst1q_f16((__fp16*)(dqd + row1 + t), rq1);
+                // Convert to fp32 for dW sgemm
+                vst1q_f32(fp32_dq + row0 + t,     vcvt_f32_f16(vget_low_f16(rq0)));
+                vst1q_f32(fp32_dq + row0 + t + 4,  vcvt_f32_f16(vget_high_f16(rq0)));
+                vst1q_f32(fp32_dq + row1 + t,     vcvt_f32_f16(vget_low_f16(rq1)));
+                vst1q_f32(fp32_dq + row1 + t + 4,  vcvt_f32_f16(vget_high_f16(rq1)));
+                // Inverse dK rotation
+                float16x8_t dk0 = vld1q_f16((const __fp16*)(dks + row0 + t));
+                float16x8_t dk1 = vld1q_f16((const __fp16*)(dks + row1 + t));
+                float16x8_t rk0 = vfmaq_f16(vmulq_f16(dk0, cv), dk1, sv);
+                float16x8_t rk1 = vfmsq_f16(vmulq_f16(dk1, cv), dk0, sv);
+                vst1q_f16((__fp16*)(dkd + row0 + t), rk0);
+                vst1q_f16((__fp16*)(dkd + row1 + t), rk1);
+                vst1q_f32(fp32_dk + row0 + t,     vcvt_f32_f16(vget_low_f16(rk0)));
+                vst1q_f32(fp32_dk + row0 + t + 4,  vcvt_f32_f16(vget_high_f16(rk0)));
+                vst1q_f32(fp32_dk + row1 + t,     vcvt_f32_f16(vget_low_f16(rk1)));
+                vst1q_f32(fp32_dk + row1 + t + 4,  vcvt_f32_f16(vget_high_f16(rk1)));
+            }
+            for (; t < SEQ; t++) {
+                _Float16 cv = tbl[t*2], sv = tbl[t*2+1];
+                _Float16 dq0v = dqs[row0+t], dq1v = dqs[row1+t];
+                _Float16 rq0v = dq0v*cv + dq1v*sv, rq1v = -dq0v*sv + dq1v*cv;
+                dqd[row0+t] = rq0v; dqd[row1+t] = rq1v;
+                fp32_dq[row0+t] = (float)rq0v; fp32_dq[row1+t] = (float)rq1v;
+                _Float16 dk0v = dks[row0+t], dk1v = dks[row1+t];
+                _Float16 rk0v = dk0v*cv + dk1v*sv, rk1v = -dk0v*sv + dk1v*cv;
+                dkd[row0+t] = rk0v; dkd[row1+t] = rk1v;
+                fp32_dk[row0+t] = (float)rk0v; fp32_dk[row1+t] = (float)rk1v;
             }
         }
     }

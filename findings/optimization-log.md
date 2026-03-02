@@ -750,3 +750,39 @@ Added a 64-slot open-addressing hash table caching IOSurfaceRef → MTLBuffer ma
 Caching recovered ~10ms (the buffer creation overhead), but **+13ms remains** from Metal command buffer submission pipeline (~540µs × 24 dispatches). The per-layer loop structure prevents batching dispatches because each layer depends on the previous one's output.
 
 **Verdict: GPU RoPE is a dead end at this problem size.** The right insight (eliminate format conversions) needs a different tool: NEON fp16 RoPE with precomputed cos/sin table — same zero-conversion benefit, zero dispatch overhead.
+
+---
+
+## 19. NEON fp16 RoPE: Eliminate Format Conversions
+
+**What:** Replaced CPU fp32 RoPE path with NEON fp16 intrinsics operating directly on IOSurface fp16 data, eliminating all fp16↔fp32 format conversions in the RoPE step. Same insight as GPU RoPE (#18) but zero dispatch overhead.
+
+Components:
+- Precomputed cos/sin table: `[HD/2][SEQ][2]` fp16, 32KB, computed once at init
+- `neon_rope_fwd_f16()`: NEON vectorized fp16→fp16 forward RoPE (`vfmsq_f16`/`vfmaq_f16`, 8-wide)
+  - Reads Q,K from qkvFwd IOSurface, writes RoPE'd Q,K to attnFwd IOSurface, all fp16
+  - Also copies V and reads xnorm/rrms in the same locked region
+- `neon_rope_bwd_f16()`: NEON fp16 inverse RoPE with **fused fp32 output**
+  - Single pass writes both fp16 (to qkvBwd IOSurface for ANE backward) and fp32 (for dW sgemm)
+  - Uses `vcvt_f32_f16` to convert rotated results inline, avoiding a separate read-back pass
+- Deleted `metal_gpu.h`, removed `-framework Metal` from build
+- `--cpu-rope` flag retained for A/B comparison
+
+**Result (20 steps, accum=50, back-to-back warm):**
+
+| Metric | CPU fp32 RoPE | NEON fp16 RoPE | Delta |
+|--------|--------------|----------------|-------|
+| **ms/step** | **92.3** | **73.6** | **-18.7 (20% faster)** |
+| fwd io | 11.5 | 5.7 | -5.8 |
+| bwd io | 25.4 | 14.0 | -11.4 |
+| **total io** | **36.9** | **19.7** | **-17.2** |
+| step 0 loss | 0.8210 | 0.8209 | fp16 rounding |
+| step 10 loss | 0.8019 | 0.8016 | fp16 rounding |
+
+**Correctness:** Verified — loss trajectories match within fp16 rounding.
+
+**Analysis:** IO savings of 17.2ms account for nearly all of the 18.7ms improvement. Per layer, eliminated:
+- Forward: 2× `cvt_f16_f32` (Q,K read) + `cpu_rope_cf` (fp32 trig) + 2× `cvt_f32_f16` (Q,K write) → 1× `neon_rope_fwd_f16` (fp16 in-place rotation)
+- Backward: 2× `cvt_f16_f32` (dQ,dK read) + `cpu_rope_backward_cf` (fp32 trig) + 2× `cvt_f32_f16` (write back) → 1× `neon_rope_bwd_f16` (fp16 rotation + fused fp32 output)
+
+The dW sgemm times appear higher for NEON (396 vs 276 total) but these are fully overlapped with ANE (sem_wait=0.0 across all layers), so they don't affect step time.
