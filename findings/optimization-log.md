@@ -737,4 +737,16 @@ Components:
 
 The CPU RoPE path (NEON fp16↔fp32 + trig) is fast enough that 98K-thread GPU dispatches with per-call setup overhead are slower. The zero-copy memory aliasing works perfectly (same pointer confirmed), but the Metal command submission pipeline has fixed overhead that dominates at this problem size.
 
-**Next step:** Cache MTLBuffers across dispatches (IOSurface addresses are stable between recompiles) to eliminate per-call `newBufferWithBytesNoCopy:` overhead. If that's insufficient, the fixed command buffer/encoder overhead (~10-50µs per dispatch × 24 dispatches) may still dominate.
+**Follow-up: MTLBuffer caching** (commit `4077985`):
+
+Added a 64-slot open-addressing hash table caching IOSurfaceRef → MTLBuffer mappings. Invalidated after recompile. Result:
+
+| Metric | GPU (uncached) | GPU (cached) | CPU baseline |
+|--------|---------------|-------------|-------------|
+| ms/step | 109.4 | 99.0 | 86.1 |
+| fwd io | 20.1 | 18.1 | 10.2 |
+| bwd io | 33.0 | 30.4 | 24.9 |
+
+Caching recovered ~10ms (the buffer creation overhead), but **+13ms remains** from Metal command buffer submission pipeline (~540µs × 24 dispatches). The per-layer loop structure prevents batching dispatches because each layer depends on the previous one's output.
+
+**Verdict: GPU RoPE is a dead end at this problem size.** The right insight (eliminate format conversions) needs a different tool: NEON fp16 RoPE with precomputed cos/sin table — same zero-conversion benefit, zero dispatch overhead.
