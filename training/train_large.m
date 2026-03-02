@@ -235,7 +235,14 @@ int main(int argc, char *argv[]) {
         float *rrms_final = (float*)malloc(SEQ*4);
         float *embed = (float*)malloc(VOCAB*DIM*4);  // [VOCAB, DIM] row-major
         float *grms_final = (float*)calloc(DIM, 4);
-        float *gembed = (float*)calloc(VOCAB*DIM, 4);
+        float *gembed_cls = (float*)calloc(VOCAB*DIM, 4);  // dense sgemm accumulator
+        float *gembed_emb = (float*)calloc(VOCAB*DIM, 4);  // scatter-add accumulator
+        // Double-buffered dlogits/x_final capture (eliminates 32MB malloc/free per step)
+        float *capt_dlogits[2], *capt_xfinal[2];
+        for (int s=0; s<2; s++) {
+            capt_dlogits[s] = (float*)malloc((size_t)SEQ*VOCAB*4);
+            capt_xfinal[s] = (float*)malloc(SEQ*DIM*4);
+        }
         AdamState arms_final = adam_alloc(DIM);
         AdamState aembed = adam_alloc((size_t)VOCAB*DIM);
 
@@ -439,12 +446,21 @@ int main(int argc, char *argv[]) {
             // Zero gradient accumulators
             for (int L=0; L<NLAYERS; L++) layer_grads_zero(&grads[L]);
             memset(grms_final, 0, DIM*4);
-            memset(gembed, 0, (size_t)VOCAB*DIM*4);
+            memset(gembed_cls, 0, (size_t)VOCAB*DIM*4);
+            memset(gembed_emb, 0, (size_t)VOCAB*DIM*4);
 
             int steps_batch = 0;
             uint64_t tt = mach_absolute_time();
             double t_ane=0,t_io=0,t_rms=0,t_cls=0;
             double t_embed=0,t_resid=0,t_xent=0,t_memcpy=0,t_rms_bwd=0,t_embed_bwd=0;
+            // dW instrumentation: per-layer sgemm times (heap-alloc for block capture)
+            double *dw_t_ffn = (double*)calloc(NLAYERS, sizeof(double));
+            double *dw_t_wo  = (double*)calloc(NLAYERS, sizeof(double));
+            double *dw_t_qkv = (double*)calloc(NLAYERS, sizeof(double));
+            __block double dw_t_embed = 0;
+            // Semaphore wait times (main thread only)
+            double t_sem_wait = 0;
+            double sem_wait_layer[NLAYERS]; memset(sem_wait_layer, 0, sizeof(sem_wait_layer));
 
             for (int a=0; a<accum_steps && step<total_steps; a++, step++) {
                 int slot = a % 2;
@@ -531,16 +547,23 @@ int main(int argc, char *argv[]) {
                                 embed, DIM, dlogits, SEQ, 0.0f, dy, SEQ);
                 }
 
-                // dembed[VOCAB,DIM] += dlogits[VOCAB,SEQ] @ x_final^T[SEQ,DIM]
-                float *capt_dlogits = (float*)malloc((size_t)SEQ*VOCAB*4);
-                memcpy(capt_dlogits, dlogits, (size_t)SEQ*VOCAB*4);
-                float *capt_xfinal = (float*)malloc(SEQ*DIM*4);
-                memcpy(capt_xfinal, x_final, SEQ*DIM*4);
+                // dembed_cls[VOCAB,DIM] += dlogits[VOCAB,SEQ] @ x_final^T[SEQ,DIM]
+                // Double-buffered capture (no malloc), tiled sgemm via dispatch_apply
+                float *cd = capt_dlogits[slot], *cx = capt_xfinal[slot];
+                memcpy(cd, dlogits, (size_t)SEQ*VOCAB*4);
+                memcpy(cx, x_final, SEQ*DIM*4);
                 dispatch_group_async(embed_dw_grp, dw_embed_q, ^{
-                    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                                VOCAB, DIM, SEQ, 1.0f,
-                                capt_dlogits, SEQ, capt_xfinal, SEQ, 1.0f, gembed, DIM);
-                    free(capt_dlogits); free(capt_xfinal);
+                    uint64_t dw0=mach_absolute_time();
+                    int ntiles = 8, chunk = VOCAB / ntiles;
+                    dispatch_apply(ntiles, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t i) {
+                        int start = (int)i * chunk;
+                        int rows = ((int)i == ntiles-1) ? (VOCAB - start) : chunk;
+                        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                                    rows, DIM, SEQ, 1.0f,
+                                    cd + (size_t)start*SEQ, SEQ, cx, SEQ,
+                                    1.0f, gembed_cls + (size_t)start*DIM, DIM);
+                    });
+                    dw_t_embed+=tb_ms(mach_absolute_time()-dw0);
                 });
 
                 // Final RMSNorm backward: dw on CPU, dx on ANE
@@ -563,7 +586,9 @@ int main(int argc, char *argv[]) {
                     LayerDWCap *cap = &dwcap[L];
 
                     // Acquire capture slot (blocks if slot still in use by async dW from 2 steps ago)
+                    { uint64_t sw0=mach_absolute_time();
                     dispatch_semaphore_wait(cap->sem, DISPATCH_TIME_FOREVER);
+                    double sw=tb_ms(mach_absolute_time()-sw0); t_sem_wait+=sw; sem_wait_layer[L]+=sw; }
 
                     // dy is the gradient at the output of this layer
                     t0=mach_absolute_time();
@@ -580,12 +605,14 @@ int main(int argc, char *argv[]) {
 
                     // dW FFN async (silu_out[slot], x2norm[slot] populated in forward)
                     dispatch_group_async(layer_dw_grp, dw_layer_q[L], ^{
+                        uint64_t dw0=mach_absolute_time();
                         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, DIM, HIDDEN, SEQ,
                                     1.0f, cap->dffn[slot], SEQ, cap->silu_out[slot], SEQ, 1.0f, gr->W2, HIDDEN);
                         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, HIDDEN, DIM, SEQ,
                                     1.0f, cap->dh1[slot], SEQ, cap->x2norm[slot], SEQ, 1.0f, gr->W1, DIM);
                         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, HIDDEN, DIM, SEQ,
                                     1.0f, cap->dh3[slot], SEQ, cap->x2norm[slot], SEQ, 1.0f, gr->W3, DIM);
+                        dw_t_ffn[L]+=tb_ms(mach_absolute_time()-dw0);
                     });
 
                     // RMSNorm2 backward: dw on CPU, dx on ANE
@@ -607,8 +634,10 @@ int main(int argc, char *argv[]) {
                     memcpy(cap->dx2[slot], dx2, SEQ*DIM*4);
                     t1=mach_absolute_time(); t_memcpy+=tb_ms(t1-t0);
                     dispatch_group_async(layer_dw_grp, dw_layer_q[L], ^{
+                        uint64_t dw0=mach_absolute_time();
                         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, DIM, DIM, SEQ,
                                     1.0f, cap->dx2[slot], SEQ, cap->attn_out[slot], SEQ, 1.0f, gr->Wo, DIM);
+                        dw_t_wo[L]+=tb_ms(mach_absolute_time()-dw0);
                     });
 
                     // SDPA backward (ANE)
@@ -625,12 +654,14 @@ int main(int argc, char *argv[]) {
 
                     // dWq/dWk/dWv async (xnorm[slot] populated in forward)
                     dispatch_group_async(layer_dw_grp, dw_layer_q[L], ^{
+                        uint64_t dw0=mach_absolute_time();
                         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, DIM, DIM, SEQ,
                                     1.0f, cap->dq[slot], SEQ, cap->xnorm[slot], SEQ, 1.0f, gr->Wq, DIM);
                         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, DIM, DIM, SEQ,
                                     1.0f, cap->dk[slot], SEQ, cap->xnorm[slot], SEQ, 1.0f, gr->Wk, DIM);
                         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, DIM, DIM, SEQ,
                                     1.0f, cap->dv[slot], SEQ, cap->xnorm[slot], SEQ, 1.0f, gr->Wv, DIM);
+                        dw_t_qkv[L]+=tb_ms(mach_absolute_time()-dw0);
                         dispatch_semaphore_signal(cap->sem);
                     });
 
@@ -656,10 +687,9 @@ int main(int argc, char *argv[]) {
                     t1=mach_absolute_time(); t_resid+=tb_ms(t1-t0);
                 }
 
-                // Embedding backward — only wait for embed dW (not layer dW)
+                // Embedding backward — scatter-add into separate accumulator (no wait needed)
                 t0=mach_absolute_time();
-                dispatch_group_wait(embed_dw_grp, DISPATCH_TIME_FOREVER);
-                embed_backward(gembed, dy, input_tokens, DIM, SEQ);
+                embed_backward(gembed_emb, dy, input_tokens, DIM, SEQ);
                 t1=mach_absolute_time(); t_embed_bwd+=tb_ms(t1-t0);
 
                 steps_batch++;
@@ -672,8 +702,10 @@ int main(int argc, char *argv[]) {
             total_batches++;
 
             // Ensure all async dW finished
+            uint64_t tw0=mach_absolute_time();
             dispatch_group_wait(layer_dw_grp, DISPATCH_TIME_FOREVER);
             dispatch_group_wait(embed_dw_grp, DISPATCH_TIME_FOREVER);
+            double t_final_dw_wait = tb_ms(mach_absolute_time()-tw0);
 
             // Adam update (scale gradients by 1/steps_batch)
             float gsc = 1.0f / steps_batch;
@@ -698,9 +730,9 @@ int main(int argc, char *argv[]) {
             }
             for(int i=0;i<DIM;i++) grms_final[i]*=gsc;
             adam_update(rms_final, grms_final, &arms_final, adam_t, lr, adam_b1, adam_b2, adam_eps);
-            // Scale and update embed
-            for(size_t i=0;i<(size_t)VOCAB*DIM;i++) gembed[i]*=gsc;
-            adam_update(embed, gembed, &aembed, adam_t, lr, adam_b1, adam_b2, adam_eps);
+            // Merge embed accumulators (cls dense + emb scatter), scale, and update
+            for(size_t i=0;i<(size_t)VOCAB*DIM;i++) gembed_cls[i] = (gembed_cls[i] + gembed_emb[i]) * gsc;
+            adam_update(embed, gembed_cls, &aembed, adam_t, lr, adam_b1, adam_b2, adam_eps);
 
             printf("  [batch %d: compile=%.0fms train=%.1fms (%.1fms/step) compiles=%d]\n",
                    steps_batch, cms, tms, tms/steps_batch, g_compile_count);
@@ -712,6 +744,19 @@ int main(int argc, char *argv[]) {
                    t_elem_total/steps_batch, t_xent/steps_batch, t_memcpy/steps_batch,
                    t_rms_bwd/steps_batch, t_resid/steps_batch, t_embed/steps_batch,
                    t_embed_bwd/steps_batch);
+            // dW instrumentation report
+            double tot_ffn=0,tot_wo=0,tot_qkv=0;
+            for(int L=0;L<NLAYERS;L++){tot_ffn+=dw_t_ffn[L];tot_wo+=dw_t_wo[L];tot_qkv+=dw_t_qkv[L];}
+            printf("    dW sgemm: ffn=%.1f wo=%.1f qkv=%.1f embed=%.1f total=%.1f ms/step\n",
+                   tot_ffn/steps_batch, tot_wo/steps_batch, tot_qkv/steps_batch,
+                   dw_t_embed/steps_batch, (tot_ffn+tot_wo+tot_qkv+dw_t_embed)/steps_batch);
+            printf("    sem_wait=%.1f final_dw_wait=%.1f ms/step\n",
+                   t_sem_wait/steps_batch, t_final_dw_wait);
+            // Per-layer semaphore wait breakdown (find the bottleneck layer)
+            printf("    sem/layer:");
+            for(int L=0;L<NLAYERS;L++) printf(" L%d=%.1f",L,sem_wait_layer[L]/steps_batch);
+            printf("\n");
+            free(dw_t_ffn); free(dw_t_wo); free(dw_t_qkv);
         }
 
         // Efficiency report
@@ -749,7 +794,9 @@ int main(int argc, char *argv[]) {
         }
         munmap(token_data, data_len);
         close(data_fd);
-        free(rms_final); free(rrms_final); free(embed); free(grms_final); free(gembed);
+        free(rms_final); free(rrms_final); free(embed); free(grms_final);
+        free(gembed_cls); free(gembed_emb);
+        for (int s=0; s<2; s++) { free(capt_dlogits[s]); free(capt_xfinal[s]); }
         adam_free(&arms_final); adam_free(&aembed);
         free(dy); free(dx_ffn); free(dx2); free(dx_attn);
         free(x_cur); free(x_final); free(logits); free(dlogits);

@@ -280,26 +280,101 @@ Changes:
 
 ---
 
+## 9. dW Instrumentation — Async Overlap Analysis
+
+**Commit:** (instrumentation, not yet committed)
+
+**What:** Added fine-grained timing inside async dW dispatch blocks and semaphore waits to diagnose the ~48ms of unaccounted overlap time. Also ran a hivemind research session (`findings/hivemind-dw-overlap.md`, Claude+Gemini+DeepSeek, 3 rounds).
+
+Instrumentation added:
+- Per-sgemm wall-clock timing inside each async block (FFN, Wo, QKV, embed)
+- Per-layer semaphore wait timing on main thread
+- Embed dW group_wait timing (separate from scatter-add)
+- Final batch dW group_wait timing
+
+**Result (100 steps, accum=50):**
+```
+101.5 ms/step (avg), batch1=102.4, batch2=100.7
+  ane=9.6  io=3.7  cls=1.8
+  elem=21.7 [xent=15.9 memcpy=1.2 rms_bwd=2.2 resid=1.5 embed=0.8 embed_bwd=0.2]
+  dW sgemm: ffn=164.4 wo=19.6 qkv=58.7 embed=51.9 total=294.5 ms/step
+  sem_wait=0.0 embed_dw_wait=10.7 final_dw_wait=0.0 ms/step
+  sem/layer: L0=0.0 L1=0.0 ... L11=0.0 (all zero)
+```
+
+**Key findings:**
+
+1. **Semaphore waits: ZERO across all layers.** Double-buffered flow control works perfectly — dW never backs up. Gemini's "First-In-Last-Out pipeline hazard" theory disproven.
+
+2. **Total dW sgemm CPU time: ~294ms/step**, distributed:
+   - FFN (W2+W1+W3 × 12 layers): 164ms
+   - QKV (Wq+Wk+Wv × 12 layers): 59ms
+   - Wo (× 12 layers): 20ms
+   - **Embed dW: 52ms** (32000×768×256 dense sgemm — classifier gradient for tied weights)
+
+3. **Effective parallelism: ~3x** — 294ms of sgemm fits into ~101ms wall time via 12 parallel serial queues + 1 embed queue.
+
+4. **Embed dW group_wait: ~11ms/step.** Main thread blocks waiting for previous step's embed sgemm to finish. The embed sgemm (52ms) often doesn't complete before the next step needs to scatter-add, causing ~11ms of visible blocking.
+
+5. **Final batch dW wait: 0.0ms.** All dW drains within the batch — no tail latency after last step.
+
+**Analysis:** The ~48ms gap is real dW compute time that doesn't fully overlap with main-thread work. With 294ms CPU sgemm and ~38ms main-thread timed work, the system achieves ~3x parallelism across ~13 queues. The bottleneck is total dW FLOP count, not scheduling or contention.
+
+**Embed dW is the #1 dW target:** At 52ms/step it's 18% of total dW time and causes 11ms of visible blocking. It's a dense `VOCAB×DIM×SEQ = 32000×768×256` sgemm because weights are tied (same `embed` array used for embedding lookup and classifier weight). The embed_backward scatter-add (0.2ms) is negligible.
+
+---
+
+## 10. Optimize Embed dW: Split Accumulators + Tiled Sgemm
+
+**What:** Three changes to the embed weight gradient computation:
+
+1. **Split accumulators:** Separate `gembed` into `gembed_cls` (dense sgemm for classifier gradient) and `gembed_emb` (scatter-add for embedding gradient). Merged at adam update. This eliminates the `dispatch_group_wait(embed_dw_grp)` between steps — the scatter-add no longer depends on the sgemm finishing.
+
+2. **Tiled sgemm via dispatch_apply:** Split the 32000×768×256 sgemm into 8 tiles of 4000 rows each, dispatched across 8 concurrent threads via `dispatch_apply` inside the serial embed queue block. Each tile: 4000×768×256 = 786M multiply-adds.
+
+3. **Double-buffered capture:** Pre-allocated two 32MB `capt_dlogits` + two 0.75MB `capt_xfinal` buffers, alternating by step slot. Eliminates per-step malloc/free of 32.75MB.
+
+**Result (100 steps, accum=50):**
+```
+92.3 ms/step (avg), batch1=89.5, batch2=95.1
+  ane=9.6  io=4.9  cls=2.1
+  elem=21.7 [xent=15.1 memcpy=1.3 rms_bwd=2.3 resid=1.7 embed=1.1 embed_bwd=0.3]
+  dW sgemm: ffn=183 wo=20 qkv=58 embed=20 total=281 ms/step
+  sem_wait=0.0 final_dw_wait=10.8 ms/step
+```
+
+| Metric | Before | After | Change |
+|---|---|---|---|
+| ms/step (100-step avg) | 101.5 | 92.3 | **-9.2ms (9.1%)** |
+| ms/step (warm batch) | 100.7 | 95.1 | **-5.6ms** |
+| embed sgemm | 52 | 20 | **-32ms (-61%)** |
+| embed_dw_wait | 11 | 0 (eliminated) | **-11ms** |
+
+**Key findings:**
+- The 8-tile `dispatch_apply` achieves ~2.6x speedup over a single sgemm call, confirming the original cblas call wasn't fully parallelizing across all P-cores at this matrix shape.
+- Eliminating the per-step embed group_wait directly removes 11ms of main-thread blocking.
+- The `final_dw_wait` (~11ms, once per 50-step batch) shows the last embed sgemm still trails the batch end slightly — acceptable since it's amortized.
+
+**Memory cost:** +98MB for second accumulator, +65.5MB for double-buffered captures. Total +163.5MB.
+
+**Correctness:** Loss unchanged (step 0: 4.3143, step 10: 3.6053, step 90: 3.7848).
+
+---
+
 ## Remaining Optimization Targets
 
-Current profile (100 steps, accum=50, batch 2 = warm):
+Current profile (100 steps, accum=50, avg of 2 batches):
 ```
-101.1 ms/step (warm batch)
-  ane=9.8  io=4.0  cls=1.9  rms_fwd=0.1
-  elem=33.9 [xent=15.4 memcpy=1.2 rms_bwd=2.0 resid=1.0 embed=1.2 embed_bwd=13.1]
-  ~48ms unaccounted = async dW cblas overlap
+92.3 ms/step
+  ane=9.6  io=4.9  cls=2.1
+  elem=21.7 [xent=15.1 memcpy=1.3 rms_bwd=2.3 resid=1.7 embed=1.1 embed_bwd=0.3]
+  dW sgemm: ffn=183 wo=20 qkv=58 embed=20 total=281 ms/step (~3.0x overlap)
+  sem_wait=0.0 final_dw_wait=10.8 ms/step (once per 50-step batch)
 ```
 
 ### Prioritized by risk-adjusted impact
 
-1. **xent ~15ms** — Fused cross-entropy on ANE (see hivemind analysis above). **~15ms, high risk.** Treat as research spike.
-2. **embed_bwd ~9-13ms** — Embed dW wait + scatter-add. Dominated by dispatch_group_wait on embed outer product sgemm. **Variable, medium effort.**
-3. **io ~4ms** — Keep activations in fp16 end-to-end, skip fp32↔fp16 conversion. Requires numerical stability analysis for backward pass. **~4ms, medium risk.**
-4. **rms_bwd ~2ms** — Now nearly minimal (just 768 × 3 vDSP calls for dw accumulation). Diminishing returns.
-5. **resid ~1ms** — Backward residual adds. Could fuse into backward ANE kernels. **~1ms, diminishing returns.**
-
-### Architecture-level (larger refactors)
-- Fuse rmsnorm + conv into single ANE kernel (reduce kernel eval count)
-- Pipeline: overlap step N's backward with step N+1's forward (double-buffer IOSurfaces)
-- Full fp16 activation path (eliminate io conversion entirely)
-- **The 48ms elephant:** async dW cblas overlap is ~47% of step time. Restructuring dW dispatch or reducing dW compute could have outsized impact.
+1. **xent ~15ms** — Fused cross-entropy on ANE (see hivemind analysis). **~15ms, high risk.** Research spike.
+2. **io ~5ms** — Keep activations in fp16 end-to-end. **~5ms, medium risk.**
+3. **Layer dW structure** — Consolidate 12 serial queues, use QoS tiers, or tile layer sgemms with dispatch_apply (proven effective for embed). FFN dW at 183ms is the biggest chunk. **Speculative, needs experimentation.**
+4. **rms_bwd ~2ms, resid ~1.7ms, memcpy ~1.3ms** — Diminishing returns individually, ~5ms combined.
