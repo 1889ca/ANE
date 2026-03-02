@@ -25,13 +25,12 @@
 #define DEFAULT_ACCUM_STEPS 50
 #define DEFAULT_MAX_COMPILES 200
 
-// Per compile: 5 weight-bearing kernels per layer + 1 classifier = 5*12+1 = 61
+// Per compile: 6 weight-bearing kernels per layer + 1 classifier = 6*12+1 = 73
 // Plus 1 static (sdpaBwd2 per layer, no weights) = 12 more but those are weight-free
-// Actually sdpaBwd2 has no weights, compile once per layer
-// Weight-bearing: fwdAttn(1) + fwdFFN(1) + ffnBwd(1) + sdpaBwd1(1) + qkvBwd(1) = 5 per layer
-// 5 * 12 = 60 weight-bearing compiles per batch
-// With MAX_COMPILES=100, we get 1 batch of ACCUM_STEPS before restart
-#define KERNELS_PER_LAYER 5
+// Weight-bearing: qkvFwd(1) + attnFwd(1) + fwdFFN(1) + ffnBwd(1) + sdpaBwd1(1) + qkvBwd(1) = 6 per layer
+// 6 * 12 = 72 weight-bearing compiles per batch
+// With MAX_COMPILES=200, we get 2 batches per exec() cycle
+#define KERNELS_PER_LAYER 6
 #define TOTAL_WEIGHT_KERNELS (KERNELS_PER_LAYER * NLAYERS)
 #define CLS_KERNELS 2
 
@@ -104,7 +103,7 @@ typedef struct {
 // ANE kernels per layer
 typedef struct { void *model; IOSurfaceRef ioIn, ioOut; void *request; void *tmpDir; } Kern;
 typedef struct {
-    Kern *fwdAttn, *fwdFFN, *ffnBwd, *sdpaBwd1, *sdpaBwd2, *qkvBwd, *rmsBwd;
+    Kern *qkvFwd, *attnFwd, *fwdFFN, *ffnBwd, *sdpaBwd1, *sdpaBwd2, *qkvBwd, *rmsBwd;
 } LayerKernels;
 
 // Checkpoint header

@@ -79,6 +79,49 @@ static float cross_entropy_loss(float *dlogits, const float *logits, const uint1
     return total_loss / S;
 }
 
+// RoPE forward (channel-first [DIM, SEQ] layout)
+// In-place: q[h*HD+i, t], index = (h*HD+i)*S + t
+// Loop: heads → dim pairs (outer) → positions (inner) for cache-friendly row access
+static void cpu_rope_cf(float *q, float *k, int S, int n_heads, int head_dim) {
+    for (int h = 0; h < n_heads; h++) {
+        for (int i = 0; i < head_dim; i += 2) {
+            float freq = 1.0f / powf(10000.0f, (float)i / head_dim);
+            int row0 = (h * head_dim + i) * S;
+            int row1 = (h * head_dim + i + 1) * S;
+            for (int t = 0; t < S; t++) {
+                float cos_v = cosf(t * freq), sin_v = sinf(t * freq);
+                float q0 = q[row0 + t], q1 = q[row1 + t];
+                q[row0 + t] = q0 * cos_v - q1 * sin_v;
+                q[row1 + t] = q0 * sin_v + q1 * cos_v;
+                float k0 = k[row0 + t], k1 = k[row1 + t];
+                k[row0 + t] = k0 * cos_v - k1 * sin_v;
+                k[row1 + t] = k0 * sin_v + k1 * cos_v;
+            }
+        }
+    }
+}
+
+// RoPE backward (channel-first [DIM, SEQ] layout)
+// Inverse rotation: transpose of rotation matrix (cos, +sin; -sin, cos)
+static void cpu_rope_backward_cf(float *dq, float *dk, int S, int n_heads, int head_dim) {
+    for (int h = 0; h < n_heads; h++) {
+        for (int i = 0; i < head_dim; i += 2) {
+            float freq = 1.0f / powf(10000.0f, (float)i / head_dim);
+            int row0 = (h * head_dim + i) * S;
+            int row1 = (h * head_dim + i + 1) * S;
+            for (int t = 0; t < S; t++) {
+                float cos_v = cosf(t * freq), sin_v = sinf(t * freq);
+                float dq0 = dq[row0 + t], dq1 = dq[row1 + t];
+                dq[row0 + t] =  dq0 * cos_v + dq1 * sin_v;
+                dq[row1 + t] = -dq0 * sin_v + dq1 * cos_v;
+                float dk0 = dk[row0 + t], dk1 = dk[row1 + t];
+                dk[row0 + t] =  dk0 * cos_v + dk1 * sin_v;
+                dk[row1 + t] = -dk0 * sin_v + dk1 * cos_v;
+            }
+        }
+    }
+}
+
 // Embedding lookup: token_ids → x [DIM, SEQ] (channel-first)
 // embed is [VOCAB, DIM] row-major (vocab_size rows, dim cols)
 static void embed_lookup(float *x, const float *embed, const uint16_t *tokens, int dim, int seq) {

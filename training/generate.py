@@ -3,7 +3,7 @@
 
 Forward pass matches the ANE training kernels exactly:
   - Channel-first [DIM, T] layout
-  - Causal masking (no RoPE — training kernels don't use it)
+  - Causal masking with RoPE positional encoding
   - RMSNorm, multi-head SDPA, SiLU FFN
 """
 
@@ -109,6 +109,23 @@ def rmsnorm(x, w):
     return x * (1.0 / np.sqrt(ss)) * w[:, None]
 
 
+def apply_rope(Q, K, T):
+    """Apply RoPE to Q, K in [HEADS, T, HD] layout."""
+    for h in range(HEADS):
+        for i in range(0, HD, 2):
+            freq = 1.0 / (10000.0 ** (i / HD))
+            for t in range(T):
+                cos_v = math.cos(t * freq)
+                sin_v = math.sin(t * freq)
+                q0, q1 = Q[h, t, i], Q[h, t, i + 1]
+                Q[h, t, i] = q0 * cos_v - q1 * sin_v
+                Q[h, t, i + 1] = q0 * sin_v + q1 * cos_v
+                k0, k1 = K[h, t, i], K[h, t, i + 1]
+                K[h, t, i] = k0 * cos_v - k1 * sin_v
+                K[h, t, i + 1] = k0 * sin_v + k1 * cos_v
+    return Q, K
+
+
 def forward(W, tokens):
     """Full forward pass matching ANE training kernels. Returns logits at last position."""
     T = len(tokens)
@@ -125,6 +142,7 @@ def forward(W, tokens):
         Q = (W[f'Wq{L}'] @ xn).reshape(HEADS, HD, T).transpose(0, 2, 1)
         K = (W[f'Wk{L}'] @ xn).reshape(HEADS, HD, T).transpose(0, 2, 1)
         V = (W[f'Wv{L}'] @ xn).reshape(HEADS, HD, T).transpose(0, 2, 1)
+        Q, K = apply_rope(Q, K, T)
 
         scores = (Q @ K.transpose(0, 2, 1)) / math.sqrt(HD) + mask[None, :, :]
         scores -= np.max(scores, axis=-1, keepdims=True)
@@ -178,7 +196,7 @@ if __name__ == '__main__':
 
     # Load pretrained baseline
     print("=" * 60)
-    print("PRETRAINED (no training, no RoPE)")
+    print("PRETRAINED (no training, with RoPE)")
     print("=" * 60)
     W_pre = load_pretrained(MODEL_PATH)
 
@@ -200,7 +218,7 @@ if __name__ == '__main__':
         sys.exit(1)
 
     print("=" * 60)
-    print("TRAINED (lr=3e-5, ~900 steps, no RoPE)")
+    print("TRAINED (with RoPE)")
     print("=" * 60)
     W_train, step, loss = load_checkpoint(CKPT_PATH)
     print(f"Checkpoint: step={step}, loss={loss:.4f}\n")
