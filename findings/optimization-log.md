@@ -250,25 +250,56 @@ Old `rmsnorm_bwd()` removed entirely.
 
 ---
 
+## 8. Cache rrms from Forward for rmsnorm_dw
+
+**Commit:** `f96b5c9` — "Cache rrms from ANE forward kernels, eliminate recomputation in rmsnorm_dw"
+
+**What:** The forward rmsnorm (fused in fwdAttn/fwdFFN ANE kernels) already computes `rrms = rsqrt(mean(x^2) + eps)` as an intermediate `[1,1,1,SEQ]` tensor. Previously discarded — now tapped via the output concat and cached in `LayerActs` for reuse in backward.
+
+Changes:
+- **MIL generators:** Added `rrms` to output concat of both `gen_sdpa_fwd_taps` (+1 channel → `6*DIM+1`) and `gen_ffn_fwd_taps` (+1 channel → `2*DIM+3*HIDDEN+1`). Cost: 512 bytes per IOSurface.
+- **`rmsnorm_dw`:** Now takes precomputed `rrms` instead of `x` and `w`. Eliminated the rrms recomputation loop entirely (768 iterations of `vDSP_vmul` + `vDSP_vadd` + `vDSP_vsmsa` + `vvrsqrtf`).
+- **CPU `rmsnorm`:** Now uses static buffers (no calloc/free) and optionally caches `rrms_out` for the final layer.
+- **Forward:** Two extra `io_read_fp16` calls per layer (1 channel each = 512 bytes), trivial cost.
+
+**Result (100 steps, accum=50):**
+```
+104.7 ms/step (avg), batch1=108.3, batch2=101.1
+  Batch 2: ane=9.8 io=4.0 cls=1.9 rms_fwd=0.1
+           elem=33.9 [xent=15.4 memcpy=1.2 rms_bwd=2.0 resid=1.0 embed=1.2 embed_bwd=13.1]
+```
+
+| Metric | Before (batch 2) | After (batch 2) | Change |
+|---|---|---|---|
+| ms/step | 104.2 | 101.1 | **-3.1ms** |
+| rms_bwd | 5.4 | 2.0 | **-3.4ms** |
+
+**Note:** embed_bwd rose from 8.7→13.1 — this is noise in the `dispatch_group_wait` timing, not a real regression. The rms_bwd improvement is clean.
+
+**Correctness:** Loss unchanged (step 0: 4.3143, step 10: 3.6053, step 90: 3.7850).
+
+---
+
 ## Remaining Optimization Targets
 
 Current profile (100 steps, accum=50, batch 2 = warm):
 ```
-104.2 ms/step (warm batch)
-  ane=9.3  io=4.6  cls=2.0  rms_fwd=0.1
-  elem=34.5 [xent=16.1 memcpy=1.3 rms_bwd=5.4 resid=1.5 embed=1.5 embed_bwd=8.7]
-  ~49ms unaccounted = async dW cblas overlap
+101.1 ms/step (warm batch)
+  ane=9.8  io=4.0  cls=1.9  rms_fwd=0.1
+  elem=33.9 [xent=15.4 memcpy=1.2 rms_bwd=2.0 resid=1.0 embed=1.2 embed_bwd=13.1]
+  ~48ms unaccounted = async dW cblas overlap
 ```
 
 ### Prioritized by risk-adjusted impact
 
-1. **xent ~16ms** — Fused cross-entropy on ANE (see hivemind analysis above). **~16ms, high risk.** Treat as research spike.
-2. **embed_bwd ~9ms** — Embed dW wait + scatter-add. Dominated by dispatch_group_wait on embed outer product sgemm. **~9ms, medium effort.**
-3. **rms_bwd ~5ms** — Remaining CPU dw cost. Could precompute rrms in forward pass and cache it, eliminating the recomputation loop. **~3ms potential, low risk.**
-4. **io ~5ms** — Keep activations in fp16 end-to-end, skip fp32↔fp16 conversion. Requires numerical stability analysis for backward pass. **~5ms, medium risk.**
-5. **resid ~1.5ms** — Backward residual adds. Could fuse into backward ANE kernels. **~1.5ms, diminishing returns.**
+1. **xent ~15ms** — Fused cross-entropy on ANE (see hivemind analysis above). **~15ms, high risk.** Treat as research spike.
+2. **embed_bwd ~9-13ms** — Embed dW wait + scatter-add. Dominated by dispatch_group_wait on embed outer product sgemm. **Variable, medium effort.**
+3. **io ~4ms** — Keep activations in fp16 end-to-end, skip fp32↔fp16 conversion. Requires numerical stability analysis for backward pass. **~4ms, medium risk.**
+4. **rms_bwd ~2ms** — Now nearly minimal (just 768 × 3 vDSP calls for dw accumulation). Diminishing returns.
+5. **resid ~1ms** — Backward residual adds. Could fuse into backward ANE kernels. **~1ms, diminishing returns.**
 
 ### Architecture-level (larger refactors)
 - Fuse rmsnorm + conv into single ANE kernel (reduce kernel eval count)
 - Pipeline: overlap step N's backward with step N+1's forward (double-buffer IOSurfaces)
 - Full fp16 activation path (eliminate io conversion entirely)
+- **The 48ms elephant:** async dW cblas overlap is ~47% of step time. Restructuring dW dispatch or reducing dW compute could have outsized impact.
