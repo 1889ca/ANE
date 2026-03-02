@@ -701,3 +701,40 @@ From ObjC runtime enumeration of ANE frameworks:
 | `_ANEVirtualClient` | `doEvaluateWithModel:...completionEvent:...` | Evaluation with completion event parameter |
 
 The `_ANEChainingRequest` class with `loopbackInputSymbolId`/`loopbackOutputSymbolId` suggests ANE supports request chaining where one kernel's output feeds directly to the next — potentially without CPU involvement at all.
+
+---
+
+## 18. GPU RoPE via Zero-Copy IOSurface→MTLBuffer — REGRESSION
+
+**Commit:** `40a7b84` — "GPU RoPE via zero-copy IOSurface→MTLBuffer"
+
+**What:** Metal compute shaders operating directly on fp16 IOSurface data, eliminating fp16→fp32→rotate→fp32→fp16 round-trips. Used `newBufferWithBytesNoCopy:` from `IOSurfaceGetBaseAddress()` for true zero-copy MTLBuffer aliasing (proven in #17).
+
+Components:
+- `metal_gpu.h`: MetalCtx struct, precomputed cos/sin table (32KB fp16), RoPE forward/backward shaders, zero-copy dispatch helpers
+- Forward: GPU writes RoPE'd Q,K to attnFwd channels 0-1, CPU writes V+x_cur to channels 2-3 (non-overlapping)
+- Backward: GPU inverse RoPE sdpaBwd2→qkvBwd channels 0-1, CPU copies dV to channel 2, reads back un-RoPE'd dQ,dK for dW sgemm
+- `--cpu-rope` flag for A/B comparison
+
+**Result (20 steps, accum=50):**
+
+| Metric | GPU RoPE | CPU RoPE (--cpu-rope) | Delta |
+|--------|----------|----------------------|-------|
+| **ms/step** | **109.4** | **96.8** | **+12.6 (REGRESSION)** |
+| fwd io | 20.1 | 13.1 | +7.0 |
+| bwd io | 33.0 | 28.5 | +4.5 |
+| fwd ane | 11.9 | 11.5 | +0.4 |
+| bwd ane | 26.5 | 25.4 | +1.1 |
+| step 0 loss | 0.8210 | 0.8210 | identical |
+| step 10 loss | 0.8020 | 0.8019 | fp16 rounding |
+
+**Correctness:** Verified — loss trajectories match within fp16 rounding.
+
+**Root cause:** Metal dispatch overhead exceeds format conversion savings. Per step:
+- 24 × `newBufferWithBytesNoCopy:` calls (ephemeral MTLBuffer creation per dispatch)
+- 24 × command buffer creation + compute encoder + commit + `waitUntilCompleted`
+- Total GPU overhead: ~11.5ms, vs ~0ms for eliminated CPU format conversions
+
+The CPU RoPE path (NEON fp16↔fp32 + trig) is fast enough that 98K-thread GPU dispatches with per-call setup overhead are slower. The zero-copy memory aliasing works perfectly (same pointer confirmed), but the Metal command submission pipeline has fixed overhead that dominates at this problem size.
+
+**Next step:** Cache MTLBuffers across dispatches (IOSurface addresses are stable between recompiles) to eliminate per-call `newBufferWithBytesNoCopy:` overhead. If that's insufficient, the fixed command buffer/encoder overhead (~10-50µs per dispatch × 24 dispatches) may still dominate.

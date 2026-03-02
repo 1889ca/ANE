@@ -8,15 +8,55 @@
 #define METAL_SEQ_STR "___SEQ___"
 #define METAL_HD_STR  "___HD___"
 
+// IOSurface → MTLBuffer cache (avoids per-dispatch newBufferWithBytesNoCopy overhead)
+// Open-addressing hash table, 64 slots (supports ~48 unique IOSurfaces across 12 layers)
+#define MTL_BUF_CACHE_SIZE 64
+#define MTL_BUF_CACHE_MASK (MTL_BUF_CACHE_SIZE - 1)
+
+typedef struct {
+    IOSurfaceRef key;        // NULL = empty slot
+    id<MTLBuffer> buffer;
+} MTLBufCacheEntry;
+
 typedef struct {
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
     id<MTLComputePipelineState> rope_fwd;
     id<MTLComputePipelineState> rope_bwd;
     id<MTLBuffer> cos_sin_table;  // precomputed [HD/2 * SEQ * 2] fp16
+    MTLBufCacheEntry buf_cache[MTL_BUF_CACHE_SIZE];
 } MetalCtx;
 
 static MetalCtx g_metal;
+
+// Cache lookup/insert — returns cached MTLBuffer for an IOSurface
+static id<MTLBuffer> metal_get_buffer(IOSurfaceRef surf) {
+    uintptr_t h = ((uintptr_t)surf >> 4) & MTL_BUF_CACHE_MASK;
+    for (int i = 0; i < MTL_BUF_CACHE_SIZE; i++) {
+        int idx = (h + i) & MTL_BUF_CACHE_MASK;
+        if (g_metal.buf_cache[idx].key == surf) return g_metal.buf_cache[idx].buffer;
+        if (g_metal.buf_cache[idx].key == NULL) {
+            // Empty slot — create and cache
+            void *addr = IOSurfaceGetBaseAddress(surf);
+            size_t len = IOSurfaceGetAllocSize(surf);
+            id<MTLBuffer> buf = [g_metal.device newBufferWithBytesNoCopy:addr length:len
+                                                                 options:MTLResourceStorageModeShared deallocator:nil];
+            g_metal.buf_cache[idx].key = surf;
+            g_metal.buf_cache[idx].buffer = buf;
+            return buf;
+        }
+    }
+    // Cache full (shouldn't happen with 64 slots and ~48 surfaces) — create uncached
+    void *addr = IOSurfaceGetBaseAddress(surf);
+    size_t len = IOSurfaceGetAllocSize(surf);
+    return [g_metal.device newBufferWithBytesNoCopy:addr length:len
+                                             options:MTLResourceStorageModeShared deallocator:nil];
+}
+
+// Invalidate cache — call after recompile when IOSurfaces are freed/reallocated
+static void metal_invalidate_cache(void) {
+    memset(g_metal.buf_cache, 0, sizeof(g_metal.buf_cache));
+}
 
 // RoPE forward shader: (cos, -sin; sin, cos) rotation on Q and K simultaneously
 // Channel-first layout: element [h*HD+i, t] at offset (h*HD+i)*SEQ + t
@@ -145,6 +185,7 @@ static bool metal_init(void) {
                                                        options:MTLResourceStorageModeShared];
     free(tbl);
 
+    metal_invalidate_cache();
     printf("  [metal] GPU RoPE initialized: %s, table=%d bytes\n",
            [[g_metal.device name] UTF8String], tbl_elems * 2);
     return true;
@@ -156,16 +197,8 @@ static bool metal_init(void) {
 static void metal_rope_fwd(IOSurfaceRef src, IOSurfaceRef dst,
                            uint32_t q_src_off, uint32_t k_src_off,
                            uint32_t q_dst_off, uint32_t k_dst_off) {
-    void *src_addr = IOSurfaceGetBaseAddress(src);
-    void *dst_addr = IOSurfaceGetBaseAddress(dst);
-    size_t src_len = IOSurfaceGetAllocSize(src);
-    size_t dst_len = IOSurfaceGetAllocSize(dst);
-
-    id<MTLBuffer> src_buf = [g_metal.device newBufferWithBytesNoCopy:src_addr length:src_len
-                                                             options:MTLResourceStorageModeShared deallocator:nil];
-    id<MTLBuffer> dst_buf = (src == dst) ? src_buf :
-        [g_metal.device newBufferWithBytesNoCopy:dst_addr length:dst_len
-                                         options:MTLResourceStorageModeShared deallocator:nil];
+    id<MTLBuffer> src_buf = metal_get_buffer(src);
+    id<MTLBuffer> dst_buf = (src == dst) ? src_buf : metal_get_buffer(dst);
 
     id<MTLCommandBuffer> cmd = [g_metal.queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
@@ -190,16 +223,8 @@ static void metal_rope_fwd(IOSurfaceRef src, IOSurfaceRef dst,
 static void metal_rope_bwd(IOSurfaceRef src, IOSurfaceRef dst,
                            uint32_t q_src_off, uint32_t k_src_off,
                            uint32_t q_dst_off, uint32_t k_dst_off) {
-    void *src_addr = IOSurfaceGetBaseAddress(src);
-    void *dst_addr = IOSurfaceGetBaseAddress(dst);
-    size_t src_len = IOSurfaceGetAllocSize(src);
-    size_t dst_len = IOSurfaceGetAllocSize(dst);
-
-    id<MTLBuffer> src_buf = [g_metal.device newBufferWithBytesNoCopy:src_addr length:src_len
-                                                             options:MTLResourceStorageModeShared deallocator:nil];
-    id<MTLBuffer> dst_buf = (src == dst) ? src_buf :
-        [g_metal.device newBufferWithBytesNoCopy:dst_addr length:dst_len
-                                         options:MTLResourceStorageModeShared deallocator:nil];
+    id<MTLBuffer> src_buf = metal_get_buffer(src);
+    id<MTLBuffer> dst_buf = (src == dst) ? src_buf : metal_get_buffer(dst);
 
     id<MTLCommandBuffer> cmd = [g_metal.queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];

@@ -417,6 +417,7 @@ int main(int argc, char *argv[]) {
             // Compile all layers' weight-bearing kernels
             uint64_t tc = mach_absolute_time();
             for (int L=0; L<NLAYERS; L++) free_layer_kernels(&kern[L]);
+            if (gpu_rope) metal_invalidate_cache();
 
             __block bool compile_ok = true;
             dispatch_queue_t cq = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
