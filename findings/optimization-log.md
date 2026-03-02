@@ -204,22 +204,66 @@ Three categories of elimination:
 
 ---
 
+## 7. Move rmsnorm_bwd dx to ANE
+
+**Commit:** `8bca719` — "Move rmsnorm_bwd dx computation to ANE, keep dw on CPU"
+
+**What:** Split `rmsnorm_bwd` into two parts:
+- **dx (ANE):** New weight-free MIL kernel `gen_rms_bwd()` computes the input gradient. Input `[1, 3*DIM, 1, SEQ]` packs dy, x, and w (weight at position 0 only via `slice_by_size`). 13 kernels compiled at startup (12 per-layer + 1 final), reused across steps like `sdpaBwd2`.
+- **dw (CPU):** New `rmsnorm_dw()` function — weight gradient only (cheap reduction: recompute rrms, then `sum(dy * x * rrms)` per channel). Uses static buffer to avoid per-call malloc.
+
+Old `rmsnorm_bwd()` removed entirely.
+
+**Key design decisions:**
+- Each layer reuses the same `rmsBwd` kernel for both rmsnorm1 (attn) and rmsnorm2 (ffn) — sequential calls, IOSurface repopulated between them.
+- `io_copy` sources dy/x from prior ANE kernel outputs (fp16→fp16, no conversion). New `io_write_fp16_vec` helper packs the weight vector at channel offset `2*DIM`, position 0 only.
+- dw computed FIRST (while fp32 dy is still available), then ANE kernel overwrites the buffer with dx.
+- Final rmsnorm backward: falls back to `io_write_fp16_at` for dy when `use_ane_cls=false` (no cls_bwd->ioOut to io_copy from).
+
+**Eliminated:**
+- 25 CPU `rmsnorm_bwd` calls (replaced by 25 `rmsnorm_dw` + 25 ANE evals)
+- `dx_rms1` calloc+free per layer (ANE writes dx directly to `dx_attn`)
+- `dx_rms_final` calloc+memcpy+free (ANE writes dx directly to `dy`)
+
+**Result (20 steps, accum=50):**
+```
+97.4 ms/step
+  ane=10.0  io=4.5  cls=2.3  rms_fwd=0.1
+  elem=29.5 [xent=14.3 memcpy=1.1 rms_bwd=3.3 resid=1.0 embed=1.0 embed_bwd=8.7]
+```
+
+| Metric | Before | After | Change |
+|---|---|---|---|
+| ms/step | ~99 | 97.4 | -1.6ms |
+| rms_bwd | 9.1 | 3.3 | **-5.8ms** |
+| io | 4.7 | 4.5 | -0.2ms |
+| ane | 10.3 | 10.0 | -0.3ms |
+| Compiles | 74 | 87 | +13 (well within 200 budget) |
+
+**Why only ~1.6ms net savings despite 5.8ms rms_bwd reduction:** The 25 ANE rmsBwd evals and 50 io_copy ops add ~1-2ms to ANE/IO timers. Additionally, the remaining 3.3ms of rms_bwd is the `rmsnorm_dw` function (25 calls × rrms recomputation + DIM reduction), which is bounded by vDSP throughput on the rrms recomputation loop (DIM=768 iterations × SEQ=256 vDSP ops each).
+
+**Correctness:** Loss unchanged (step 0: 4.3143, step 10: 3.6053).
+
+**Files changed:** `stories_mil.h` (gen_rms_bwd), `stories_io.h` (io_write_fp16_vec), `stories_cpu_ops.h` (rmsnorm_dw replacing rmsnorm_bwd), `stories_config.h` (rmsBwd in LayerKernels), `train_large.m` (compile+eval+cleanup)
+
+---
+
 ## Remaining Optimization Targets
 
-Current profile (warm batch, 100 steps, accum=50):
+Current profile (20 steps, accum=50):
 ```
-  ane=16.6  io=8.6  cls=5.2  rms_fwd=0.1
-  elem=72.9 [xent=30.1 memcpy=2.2 rms_bwd=16.0 resid=2.6 embed=1.1 embed_bwd=20.9]
+97.4 ms/step
+  ane=10.0  io=4.5  cls=2.3  rms_fwd=0.1
+  elem=29.5 [xent=14.3 memcpy=1.1 rms_bwd=3.3 resid=1.0 embed=1.0 embed_bwd=8.7]
+  ~48ms unaccounted = async dW cblas overlap
 ```
-
-Note: absolute values inflated ~1.7x vs baseline session. Relative proportions are what matter for prioritization.
 
 ### Prioritized by risk-adjusted impact
 
-1. **rms_bwd ~9ms** — Move rmsnorm_bwd to ANE. 25 calls/step. Involves elementwise ops + reduction (similar to forward rmsnorm already on ANE). **~9ms, medium risk.**
-2. **xent ~16ms** — Fused cross-entropy on ANE (see hivemind analysis above). **~16ms, high risk.** Treat as research spike.
-3. **io ~5ms** — Keep activations in fp16 end-to-end, skip fp32↔fp16 conversion. Requires numerical stability analysis for backward pass. **~5ms, medium risk.**
-4. **embed_bwd ~4ms** — Embed dW wait + scatter-add. Could transpose or use NEON gather for strided access. **~4ms, medium effort.**
+1. **xent ~14ms** — Fused cross-entropy on ANE (see hivemind analysis above). **~14ms, high risk.** Treat as research spike.
+2. **embed_bwd ~9ms** — Embed dW wait + scatter-add. Dominated by dispatch_group_wait on embed outer product sgemm. **~9ms, medium effort.**
+3. **io ~4.5ms** — Keep activations in fp16 end-to-end, skip fp32↔fp16 conversion. Requires numerical stability analysis for backward pass. **~4.5ms, medium risk.**
+4. **rms_bwd ~3.3ms** — Remaining CPU dw cost. Could precompute rrms in forward pass and cache it, eliminating the recomputation loop. **~2ms potential, low risk.**
 5. **resid ~1ms** — Backward residual adds. Could fuse into backward ANE kernels. **~1ms, diminishing returns.**
 
 ### Architecture-level (larger refactors)
