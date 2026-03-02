@@ -57,6 +57,18 @@ static void cvt_f32_f16(_Float16 *dst, const float *src, int n) {
     for (; i < n; i++) dst[i] = (_Float16)src[i];
 }
 
+// IOSurface batch lock helpers — lock once, do multiple reads/writes, unlock
+static _Float16 *io_lock_rw(IOSurfaceRef s) {
+    IOSurfaceLock(s, 0, NULL);
+    return (_Float16*)IOSurfaceGetBaseAddress(s);
+}
+static const _Float16 *io_lock_ro(IOSurfaceRef s) {
+    IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
+    return (const _Float16*)IOSurfaceGetBaseAddress(s);
+}
+static void io_unlock_rw(IOSurfaceRef s) { IOSurfaceUnlock(s, 0, NULL); }
+static void io_unlock_ro(IOSurfaceRef s) { IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL); }
+
 // IOSurface I/O (channel-first [C,S] layout)
 static void io_write_fp16(IOSurfaceRef s, const float *data, int channels, int sp) {
     IOSurfaceLock(s, 0, NULL);

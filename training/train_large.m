@@ -503,23 +503,32 @@ int main(int argc, char *argv[]) {
                     t1=mach_absolute_time(); t_io+=tb_ms(t1-t0); t0=t1;
                     ane_eval(kern[L].fwdAttn);
                     t1=mach_absolute_time(); t_ane+=tb_ms(t1-t0); t0=t1;
-                    io_copy(kern[L].fwdFFN->ioIn, 0, kern[L].fwdAttn->ioOut, 0, DIM, SEQ);
-                    io_read_fp16(kern[L].fwdAttn->ioOut, ac->x2,                  0,     DIM, SEQ);
-                    io_read_fp16(kern[L].fwdAttn->ioOut, dwcap[L].attn_out[slot], 4*DIM, DIM, SEQ);
-                    io_read_fp16(kern[L].fwdAttn->ioOut, dwcap[L].xnorm[slot],    5*DIM, DIM, SEQ);
-                    io_read_fp16(kern[L].fwdAttn->ioOut, ac->rrms_att,           6*DIM, 1,   SEQ);
+                    { // Batch: fwdAttn->ioOut (5 locks→1) + fwdFFN->ioIn (1 lock)
+                    const _Float16 *attn_p = io_lock_ro(kern[L].fwdAttn->ioOut);
+                    _Float16 *ffn_in_p = io_lock_rw(kern[L].fwdFFN->ioIn);
+                    memcpy(ffn_in_p, attn_p, DIM * SEQ * sizeof(_Float16));
+                    io_unlock_rw(kern[L].fwdFFN->ioIn);
+                    cvt_f16_f32(ac->x2,                  attn_p,              DIM * SEQ);
+                    cvt_f16_f32(dwcap[L].attn_out[slot], attn_p + 4*DIM*SEQ,  DIM * SEQ);
+                    cvt_f16_f32(dwcap[L].xnorm[slot],    attn_p + 5*DIM*SEQ,  DIM * SEQ);
+                    cvt_f16_f32(ac->rrms_att,            attn_p + 6*DIM*SEQ,  1 * SEQ);
+                    io_unlock_ro(kern[L].fwdAttn->ioOut);
+                    }
                     t1=mach_absolute_time(); t_io+=tb_ms(t1-t0); t0=t1;
 
                     // FFN forward (x2 already piped via io_copy)
-                    t1=mach_absolute_time(); t_io+=tb_ms(t1-t0); t0=t1;
                     ane_eval(kern[L].fwdFFN);
                     t1=mach_absolute_time(); t_ane+=tb_ms(t1-t0); t0=t1;
-                    io_read_fp16(kern[L].fwdFFN->ioOut, x_cur,                   0,            DIM,    SEQ);
-                    io_read_fp16(kern[L].fwdFFN->ioOut, ac->h1,                  DIM,          HIDDEN, SEQ);
-                    io_read_fp16(kern[L].fwdFFN->ioOut, ac->h3,                  DIM+HIDDEN,   HIDDEN, SEQ);
-                    io_read_fp16(kern[L].fwdFFN->ioOut, dwcap[L].silu_out[slot], DIM+2*HIDDEN, HIDDEN, SEQ);
-                    io_read_fp16(kern[L].fwdFFN->ioOut, dwcap[L].x2norm[slot],   DIM+3*HIDDEN, DIM,    SEQ);
-                    io_read_fp16(kern[L].fwdFFN->ioOut, ac->rrms_ffn,          2*DIM+3*HIDDEN, 1, SEQ);
+                    { // Batch: fwdFFN->ioOut (6 locks→1)
+                    const _Float16 *ffn_p = io_lock_ro(kern[L].fwdFFN->ioOut);
+                    cvt_f16_f32(x_cur,                   ffn_p,                        DIM * SEQ);
+                    cvt_f16_f32(ac->h1,                  ffn_p + DIM*SEQ,               HIDDEN * SEQ);
+                    cvt_f16_f32(ac->h3,                  ffn_p + (DIM+HIDDEN)*SEQ,      HIDDEN * SEQ);
+                    cvt_f16_f32(dwcap[L].silu_out[slot], ffn_p + (DIM+2*HIDDEN)*SEQ,    HIDDEN * SEQ);
+                    cvt_f16_f32(dwcap[L].x2norm[slot],   ffn_p + (DIM+3*HIDDEN)*SEQ,    DIM * SEQ);
+                    cvt_f16_f32(ac->rrms_ffn,            ffn_p + (2*DIM+3*HIDDEN)*SEQ,  1 * SEQ);
+                    io_unlock_ro(kern[L].fwdFFN->ioOut);
+                    }
                     t1=mach_absolute_time(); t_io+=tb_ms(t1-t0);
                 }
 
@@ -633,14 +642,24 @@ int main(int argc, char *argv[]) {
 
                     // FFN backward (ANE)
                     t0=mach_absolute_time();
-                    io_write_fp16_at(kern[L].ffnBwd->ioIn, 0, cap->dffn[slot], DIM, SEQ);
-                    io_copy(kern[L].ffnBwd->ioIn, DIM, kern[L].fwdFFN->ioOut, DIM, 2*HIDDEN, SEQ);
+                    { // Batch: ffnBwd->ioIn (2 writes→1) + fwdFFN->ioOut (1 read)
+                    _Float16 *bwd_in = io_lock_rw(kern[L].ffnBwd->ioIn);
+                    const _Float16 *fwd_out = io_lock_ro(kern[L].fwdFFN->ioOut);
+                    cvt_f32_f16(bwd_in, cap->dffn[slot], DIM * SEQ);
+                    memcpy(bwd_in + DIM*SEQ, fwd_out + DIM*SEQ, 2*HIDDEN * SEQ * sizeof(_Float16));
+                    io_unlock_ro(kern[L].fwdFFN->ioOut);
+                    io_unlock_rw(kern[L].ffnBwd->ioIn);
+                    }
                     t1=mach_absolute_time(); t_bwd_io+=tb_ms(t1-t0); t0=t1;
                     ane_eval(kern[L].ffnBwd);
                     t1=mach_absolute_time(); t_bwd_ane+=tb_ms(t1-t0); t0=t1;
-                    io_read_fp16(kern[L].ffnBwd->ioOut, dx_ffn,         0,          DIM,    SEQ);
-                    io_read_fp16(kern[L].ffnBwd->ioOut, cap->dh1[slot], DIM,        HIDDEN, SEQ);
-                    io_read_fp16(kern[L].ffnBwd->ioOut, cap->dh3[slot], DIM+HIDDEN, HIDDEN, SEQ);
+                    { // Batch: ffnBwd->ioOut (3 reads→1)
+                    const _Float16 *bwd_out = io_lock_ro(kern[L].ffnBwd->ioOut);
+                    cvt_f16_f32(dx_ffn,         bwd_out,                      DIM * SEQ);
+                    cvt_f16_f32(cap->dh1[slot], bwd_out + DIM*SEQ,            HIDDEN * SEQ);
+                    cvt_f16_f32(cap->dh3[slot], bwd_out + (DIM+HIDDEN)*SEQ,   HIDDEN * SEQ);
+                    io_unlock_ro(kern[L].ffnBwd->ioOut);
+                    }
                     t1=mach_absolute_time(); t_bwd_io+=tb_ms(t1-t0);
 
                     // dW FFN async (silu_out[slot], x2norm[slot] populated in forward)
@@ -659,9 +678,18 @@ int main(int argc, char *argv[]) {
                     t0=mach_absolute_time();
                     rmsnorm_dw(gr->rms_ffn, dx_ffn, ac->x2, ac->rrms_ffn, DIM, SEQ);
                     t1=mach_absolute_time(); t_rms_bwd+=tb_ms(t1-t0); t0=t1;
-                    io_copy(kern[L].rmsBwd->ioIn, 0,   kern[L].ffnBwd->ioOut, 0, DIM, SEQ);
-                    io_copy(kern[L].rmsBwd->ioIn, DIM, kern[L].fwdFFN->ioIn, 0, DIM, SEQ);
-                    io_write_fp16_vec(kern[L].rmsBwd->ioIn, 2*DIM, lw[L].rms_ffn, DIM, SEQ);
+                    { // Batch: rmsBwd->ioIn (3 writes→1) + ffnBwd->ioOut + fwdFFN->ioIn
+                    _Float16 *rms_in = io_lock_rw(kern[L].rmsBwd->ioIn);
+                    const _Float16 *ffn_bwd_p = io_lock_ro(kern[L].ffnBwd->ioOut);
+                    const _Float16 *ffn_fwd_p = io_lock_ro(kern[L].fwdFFN->ioIn);
+                    memcpy(rms_in, ffn_bwd_p, DIM * SEQ * sizeof(_Float16));
+                    memcpy(rms_in + DIM*SEQ, ffn_fwd_p, DIM * SEQ * sizeof(_Float16));
+                    io_unlock_ro(kern[L].fwdFFN->ioIn);
+                    io_unlock_ro(kern[L].ffnBwd->ioOut);
+                    for (int c = 0; c < DIM; c++)
+                        rms_in[(2*DIM + c) * SEQ] = (_Float16)lw[L].rms_ffn[c];
+                    io_unlock_rw(kern[L].rmsBwd->ioIn);
+                    }
                     t1=mach_absolute_time(); t_bwd_io+=tb_ms(t1-t0); t0=t1;
                     ane_eval(kern[L].rmsBwd);
                     t1=mach_absolute_time(); t_bwd_ane+=tb_ms(t1-t0); t0=t1;
@@ -685,19 +713,37 @@ int main(int argc, char *argv[]) {
 
                     // SDPA backward (ANE)
                     t0=mach_absolute_time();
-                    io_copy(kern[L].sdpaBwd1->ioIn, 0, kern[L].fwdAttn->ioOut, DIM, 3*DIM, SEQ);
-                    io_write_fp16_at(kern[L].sdpaBwd1->ioIn, 3*DIM, dx2, DIM, SEQ);
+                    { // Batch: sdpaBwd1->ioIn (2 writes→1) + fwdAttn->ioOut (1 read)
+                    _Float16 *bwd1_in = io_lock_rw(kern[L].sdpaBwd1->ioIn);
+                    const _Float16 *attn_p = io_lock_ro(kern[L].fwdAttn->ioOut);
+                    memcpy(bwd1_in, attn_p + DIM*SEQ, 3*DIM * SEQ * sizeof(_Float16));
+                    io_unlock_ro(kern[L].fwdAttn->ioOut);
+                    cvt_f32_f16(bwd1_in + 3*DIM*SEQ, dx2, DIM * SEQ);
+                    io_unlock_rw(kern[L].sdpaBwd1->ioIn);
+                    }
                     t1=mach_absolute_time(); t_bwd_io+=tb_ms(t1-t0); t0=t1;
                     ane_eval(kern[L].sdpaBwd1);
                     t1=mach_absolute_time(); t_bwd_ane+=tb_ms(t1-t0); t0=t1;
-                    io_copy(sdpaBwd2[L]->ioIn, 0, kern[L].sdpaBwd1->ioOut, DIM, 2*SCORE_CH, SEQ);
-                    io_copy(sdpaBwd2[L]->ioIn, 2*SCORE_CH, kern[L].fwdAttn->ioOut, DIM, 2*DIM, SEQ);
+                    { // Batch: sdpaBwd2->ioIn (2 writes→1) + sdpaBwd1->ioOut + fwdAttn->ioOut
+                    _Float16 *bwd2_in = io_lock_rw(sdpaBwd2[L]->ioIn);
+                    const _Float16 *bwd1_p = io_lock_ro(kern[L].sdpaBwd1->ioOut);
+                    const _Float16 *attn_p = io_lock_ro(kern[L].fwdAttn->ioOut);
+                    memcpy(bwd2_in, bwd1_p + DIM*SEQ, 2*SCORE_CH * SEQ * sizeof(_Float16));
+                    memcpy(bwd2_in + 2*SCORE_CH*SEQ, attn_p + DIM*SEQ, 2*DIM * SEQ * sizeof(_Float16));
+                    io_unlock_ro(kern[L].fwdAttn->ioOut);
+                    io_unlock_ro(kern[L].sdpaBwd1->ioOut);
+                    io_unlock_rw(sdpaBwd2[L]->ioIn);
+                    }
                     t1=mach_absolute_time(); t_bwd_io+=tb_ms(t1-t0); t0=t1;
                     ane_eval(sdpaBwd2[L]);
                     t1=mach_absolute_time(); t_bwd_ane+=tb_ms(t1-t0); t0=t1;
 
-                    io_read_fp16(sdpaBwd2[L]->ioOut, cap->dq[slot], 0,   DIM, SEQ);
-                    io_read_fp16(sdpaBwd2[L]->ioOut, cap->dk[slot], DIM, DIM, SEQ);
+                    { // Batch: sdpaBwd2->ioOut (2 reads→1)
+                    const _Float16 *bwd2_p = io_lock_ro(sdpaBwd2[L]->ioOut);
+                    cvt_f16_f32(cap->dq[slot], bwd2_p,            DIM * SEQ);
+                    cvt_f16_f32(cap->dk[slot], bwd2_p + DIM*SEQ,  DIM * SEQ);
+                    io_unlock_ro(sdpaBwd2[L]->ioOut);
+                    }
                     io_read_fp16(kern[L].sdpaBwd1->ioOut, cap->dv[slot], 0, DIM, SEQ);
                     t1=mach_absolute_time(); t_bwd_io+=tb_ms(t1-t0);
 
@@ -716,8 +762,16 @@ int main(int argc, char *argv[]) {
 
                     // QKV backward (ANE)
                     t0=mach_absolute_time();
-                    io_copy(kern[L].qkvBwd->ioIn, 0, sdpaBwd2[L]->ioOut, 0, 2*DIM, SEQ);
-                    io_copy(kern[L].qkvBwd->ioIn, 2*DIM, kern[L].sdpaBwd1->ioOut, 0, DIM, SEQ);
+                    { // Batch: qkvBwd->ioIn (2 writes→1) + sdpaBwd2->ioOut + sdpaBwd1->ioOut
+                    _Float16 *qkv_in = io_lock_rw(kern[L].qkvBwd->ioIn);
+                    const _Float16 *bwd2_p = io_lock_ro(sdpaBwd2[L]->ioOut);
+                    const _Float16 *bwd1_p = io_lock_ro(kern[L].sdpaBwd1->ioOut);
+                    memcpy(qkv_in, bwd2_p, 2*DIM * SEQ * sizeof(_Float16));
+                    memcpy(qkv_in + 2*DIM*SEQ, bwd1_p, DIM * SEQ * sizeof(_Float16));
+                    io_unlock_ro(kern[L].sdpaBwd1->ioOut);
+                    io_unlock_ro(sdpaBwd2[L]->ioOut);
+                    io_unlock_rw(kern[L].qkvBwd->ioIn);
+                    }
                     t1=mach_absolute_time(); t_bwd_io+=tb_ms(t1-t0); t0=t1;
                     ane_eval(kern[L].qkvBwd);
                     t1=mach_absolute_time(); t_bwd_ane+=tb_ms(t1-t0); t0=t1;
@@ -728,9 +782,18 @@ int main(int argc, char *argv[]) {
                     t0=mach_absolute_time();
                     rmsnorm_dw(gr->rms_att, dx_attn, ac->layer_in, ac->rrms_att, DIM, SEQ);
                     t1=mach_absolute_time(); t_rms_bwd+=tb_ms(t1-t0); t0=t1;
-                    io_copy(kern[L].rmsBwd->ioIn, 0,   kern[L].qkvBwd->ioOut, 0, DIM, SEQ);
-                    io_copy(kern[L].rmsBwd->ioIn, DIM, kern[L].fwdAttn->ioIn, 0, DIM, SEQ);
-                    io_write_fp16_vec(kern[L].rmsBwd->ioIn, 2*DIM, lw[L].rms_att, DIM, SEQ);
+                    { // Batch: rmsBwd->ioIn (3 writes→1) + qkvBwd->ioOut + fwdAttn->ioIn
+                    _Float16 *rms_in = io_lock_rw(kern[L].rmsBwd->ioIn);
+                    const _Float16 *qkv_p = io_lock_ro(kern[L].qkvBwd->ioOut);
+                    const _Float16 *attn_in = io_lock_ro(kern[L].fwdAttn->ioIn);
+                    memcpy(rms_in, qkv_p, DIM * SEQ * sizeof(_Float16));
+                    memcpy(rms_in + DIM*SEQ, attn_in, DIM * SEQ * sizeof(_Float16));
+                    io_unlock_ro(kern[L].fwdAttn->ioIn);
+                    io_unlock_ro(kern[L].qkvBwd->ioOut);
+                    for (int c = 0; c < DIM; c++)
+                        rms_in[(2*DIM + c) * SEQ] = (_Float16)lw[L].rms_att[c];
+                    io_unlock_rw(kern[L].rmsBwd->ioIn);
+                    }
                     t1=mach_absolute_time(); t_bwd_io+=tb_ms(t1-t0); t0=t1;
                     ane_eval(kern[L].rmsBwd);
                     t1=mach_absolute_time(); t_bwd_ane+=tb_ms(t1-t0); t0=t1;
