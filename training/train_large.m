@@ -213,6 +213,9 @@ int main(int argc, char *argv[]) {
         // Parse args
         bool do_resume = false;
         bool use_cpu_rope = false;
+        const char *data_path = DATA_PATH;
+        const char *ckpt_path = CKPT_PATH;
+        int freeze_below = 0;  // freeze layers 0..freeze_below-1 (no weight update)
         for (int i=1; i<argc; i++) {
             if (strcmp(argv[i], "--resume") == 0) do_resume = true;
             else if (strcmp(argv[i], "--cpu-rope") == 0) use_cpu_rope = true;
@@ -222,6 +225,9 @@ int main(int argc, char *argv[]) {
             else if (strcmp(argv[i], "--lr-min") == 0 && i+1<argc) lr_min = atof(argv[++i]);
             else if (strcmp(argv[i], "--warmup") == 0 && i+1<argc) warmup_steps = atoi(argv[++i]);
             else if (strcmp(argv[i], "--max-compiles") == 0 && i+1<argc) max_compiles = atoi(argv[++i]);
+            else if (strcmp(argv[i], "--data") == 0 && i+1<argc) data_path = argv[++i];
+            else if (strcmp(argv[i], "--ckpt") == 0 && i+1<argc) ckpt_path = argv[++i];
+            else if (strcmp(argv[i], "--freeze") == 0 && i+1<argc) freeze_below = atoi(argv[++i]);
         }
 
         // Initialize NEON fp16 RoPE table (unless --cpu-rope fallback)
@@ -271,7 +277,7 @@ int main(int argc, char *argv[]) {
         float resume_loss = 0;
         bool resuming = false;
         if (do_resume) {
-            resuming = load_checkpoint(CKPT_PATH, &start_step, &total_steps, &lr, &resume_loss,
+            resuming = load_checkpoint(ckpt_path, &start_step, &total_steps, &lr, &resume_loss,
                 &cum_compile, &cum_train, &cum_wall, &cum_steps, &cum_batches, &adam_t,
                 &accum_steps,
                 lw, la, rms_final, &arms_final, embed, &aembed);
@@ -318,8 +324,8 @@ int main(int argc, char *argv[]) {
         }
 
         // mmap token data
-        int data_fd = open(DATA_PATH, O_RDONLY);
-        if (data_fd < 0) { printf("Cannot open %s\n", DATA_PATH); return 1; }
+        int data_fd = open(data_path, O_RDONLY);
+        if (data_fd < 0) { printf("Cannot open %s\n", data_path); return 1; }
         struct stat st; fstat(data_fd, &st);
         size_t data_len = st.st_size;
         uint16_t *token_data = (uint16_t*)mmap(NULL, data_len, PROT_READ, MAP_PRIVATE, data_fd, 0);
@@ -392,7 +398,7 @@ int main(int argc, char *argv[]) {
                 free_kern(cls_fwd); free_kern(cls_bwd); cls_fwd = cls_bwd = NULL;
                 free_kern(softmax_kern); softmax_kern = NULL;
                 double wall = tb_ms(mach_absolute_time() - t_wall_start);
-                save_checkpoint(CKPT_PATH, step, total_steps, lr, last_loss,
+                save_checkpoint(ckpt_path, step, total_steps, lr, last_loss,
                     total_compile_ms+cum_compile, total_train_ms+cum_train, wall+cum_wall,
                     total_steps_done+cum_steps, total_batches+cum_batches, adam_t,
                     accum_steps,
@@ -927,7 +933,7 @@ int main(int argc, char *argv[]) {
                 cur_lr = lr_min + 0.5f * (lr - lr_min) * (1.0f + cosf(M_PI * progress));
             }
 
-            // Adam update (scale gradients by 1/steps_batch)
+            // Adam update (scale gradients by 1/steps_batch, then clip grad norm)
             float gsc = 1.0f / steps_batch;
             adam_t++;
             for (int L=0; L<NLAYERS; L++) {
@@ -937,7 +943,60 @@ int main(int argc, char *argv[]) {
                 for(size_t i=0;i<W2_SZ;i++) g->W2[i]*=gsc;
                 for(size_t i=0;i<W3_SZ;i++) g->W3[i]*=gsc;
                 for(int i=0;i<DIM;i++){g->rms_att[i]*=gsc; g->rms_ffn[i]*=gsc;}
+            }
+            for(int i=0;i<DIM;i++) grms_final[i]*=gsc;
+            for(size_t i=0;i<(size_t)VOCAB*DIM;i++) gembed_cls[i] = (gembed_cls[i] + gembed_emb[i]) * gsc;
 
+            // Zero out frozen layer gradients
+            for (int L=0; L<freeze_below && L<NLAYERS; L++) {
+                LayerGrads *g = &grads[L];
+                memset(g->Wq, 0, WQ_SZ*4); memset(g->Wk, 0, WQ_SZ*4);
+                memset(g->Wv, 0, WQ_SZ*4); memset(g->Wo, 0, WQ_SZ*4);
+                memset(g->W1, 0, W1_SZ*4); memset(g->W2, 0, W2_SZ*4);
+                memset(g->W3, 0, W3_SZ*4);
+                memset(g->rms_att, 0, DIM*4); memset(g->rms_ffn, 0, DIM*4);
+            }
+
+            // Global gradient norm clipping (max_grad_norm=1.0)
+            float grad_norm_sq = 0;
+            for (int L=0; L<NLAYERS; L++) {
+                LayerGrads *g = &grads[L];
+                float s; vDSP_Length n;
+                n=WQ_SZ; vDSP_dotpr(g->Wq,1,g->Wq,1,&s,n); grad_norm_sq+=s;
+                vDSP_dotpr(g->Wk,1,g->Wk,1,&s,n); grad_norm_sq+=s;
+                vDSP_dotpr(g->Wv,1,g->Wv,1,&s,n); grad_norm_sq+=s;
+                vDSP_dotpr(g->Wo,1,g->Wo,1,&s,n); grad_norm_sq+=s;
+                n=W1_SZ; vDSP_dotpr(g->W1,1,g->W1,1,&s,n); grad_norm_sq+=s;
+                n=W2_SZ; vDSP_dotpr(g->W2,1,g->W2,1,&s,n); grad_norm_sq+=s;
+                n=W3_SZ; vDSP_dotpr(g->W3,1,g->W3,1,&s,n); grad_norm_sq+=s;
+                n=DIM; vDSP_dotpr(g->rms_att,1,g->rms_att,1,&s,n); grad_norm_sq+=s;
+                vDSP_dotpr(g->rms_ffn,1,g->rms_ffn,1,&s,n); grad_norm_sq+=s;
+            }
+            { float s; vDSP_dotpr(grms_final,1,grms_final,1,&s,DIM); grad_norm_sq+=s; }
+            { float s; vDSP_dotpr(gembed_cls,1,gembed_cls,1,&s,(vDSP_Length)((size_t)VOCAB*DIM)); grad_norm_sq+=s; }
+            float grad_norm = sqrtf(grad_norm_sq);
+            float max_grad_norm = 1.0f;
+            float clip_coef = (grad_norm > max_grad_norm) ? max_grad_norm / grad_norm : 1.0f;
+            if (clip_coef < 1.0f) {
+                for (int L=0; L<NLAYERS; L++) {
+                    LayerGrads *g = &grads[L];
+                    vDSP_vsmul(g->Wq,1,&clip_coef,g->Wq,1,WQ_SZ);
+                    vDSP_vsmul(g->Wk,1,&clip_coef,g->Wk,1,WQ_SZ);
+                    vDSP_vsmul(g->Wv,1,&clip_coef,g->Wv,1,WQ_SZ);
+                    vDSP_vsmul(g->Wo,1,&clip_coef,g->Wo,1,WQ_SZ);
+                    vDSP_vsmul(g->W1,1,&clip_coef,g->W1,1,W1_SZ);
+                    vDSP_vsmul(g->W2,1,&clip_coef,g->W2,1,W2_SZ);
+                    vDSP_vsmul(g->W3,1,&clip_coef,g->W3,1,W3_SZ);
+                    vDSP_vsmul(g->rms_att,1,&clip_coef,g->rms_att,1,DIM);
+                    vDSP_vsmul(g->rms_ffn,1,&clip_coef,g->rms_ffn,1,DIM);
+                }
+                vDSP_vsmul(grms_final,1,&clip_coef,grms_final,1,DIM);
+                vDSP_vsmul(gembed_cls,1,&clip_coef,gembed_cls,1,(vDSP_Length)((size_t)VOCAB*DIM));
+                printf("    [grad_clip: norm=%.1f → %.1f]\n", grad_norm, max_grad_norm);
+            }
+
+            for (int L=0; L<NLAYERS; L++) {
+                LayerGrads *g = &grads[L];
                 adam_update(lw[L].Wq, g->Wq, &la[L].Wq, adam_t, cur_lr, adam_b1, adam_b2, adam_eps);
                 adam_update(lw[L].Wk, g->Wk, &la[L].Wk, adam_t, cur_lr, adam_b1, adam_b2, adam_eps);
                 adam_update(lw[L].Wv, g->Wv, &la[L].Wv, adam_t, cur_lr, adam_b1, adam_b2, adam_eps);
@@ -948,10 +1007,7 @@ int main(int argc, char *argv[]) {
                 adam_update(lw[L].rms_att, g->rms_att, &la[L].rms_att, adam_t, cur_lr, adam_b1, adam_b2, adam_eps);
                 adam_update(lw[L].rms_ffn, g->rms_ffn, &la[L].rms_ffn, adam_t, cur_lr, adam_b1, adam_b2, adam_eps);
             }
-            for(int i=0;i<DIM;i++) grms_final[i]*=gsc;
             adam_update(rms_final, grms_final, &arms_final, adam_t, cur_lr, adam_b1, adam_b2, adam_eps);
-            // Merge embed accumulators (cls dense + emb scatter), scale, and update
-            for(size_t i=0;i<(size_t)VOCAB*DIM;i++) gembed_cls[i] = (gembed_cls[i] + gembed_emb[i]) * gsc;
             adam_update(embed, gembed_cls, &aembed, adam_t, cur_lr, adam_b1, adam_b2, adam_eps);
 
             printf("  [batch %d: compile=%.0fms train=%.1fms (%.1fms/step) compiles=%d lr=%.2e]\n",
