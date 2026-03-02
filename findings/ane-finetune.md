@@ -138,11 +138,48 @@ Generate from the fine-tuned model and check that outputs are not verbatim copie
 
 Save checkpoint, reload, continue training. Loss should be continuous (no jump at reload). Already implemented and tested.
 
+## Experimental Results (March 2026)
+
+### Test: Near-distribution fine-tuning (simple stories)
+- Corpus: 1000 simple English stories, TinyStories-adjacent style, 92K tokens
+- LR=1e-4, accum=50, grad clipping max_norm=1.0
+- **Loss: 2.02 → 0.65 in 500 steps** (10 weight updates)
+- Gradient norms: 4.4 → 2.4 (naturally decreasing, healthy)
+- Training loop works correctly
+
+### Test: Cross-domain fine-tuning (Shakespeare)
+- Corpus: Complete Works of Shakespeare, 1.7M tokens
+- **FAILED at every learning rate tested:**
+  - LR=1e-4: loss 6.9 → 20+ (diverges by step 200)
+  - LR=5e-5 + warmup: loss 6.9 → 20+ (diverges by step 300)
+  - LR=1e-5: loss flat at ~7.0 (no learning in 500 steps)
+  - LR=1e-4 + freeze 10/12 layers: loss 6.9 → 15-16 (slow degradation)
+- Gradient norms explode: 10 → 600+ without clipping, stabilize at 7-10 with layer freezing
+- Root cause: fp16 backward pass through 12 transformer layers compounds precision errors on OOD data
+
+### Diagnosis
+
+The fp16-only compute path is the fundamental limitation. With the entire forward/backward on ANE in fp16:
+- In-distribution data → small loss → small gradients → stable training
+- Cross-domain data → high loss (~7 vs ~4 in-distribution) → larger gradients → fp16 precision compounds through 12 backward layers → gradient corruption → catastrophic divergence
+
+Standard mitigations (mixed-precision backward in fp32, loss scaling) are not available because the ANE only supports fp16 compute. Gradient clipping helps symptoms but not root cause — the gradients reaching CPU are already corrupted from fp16 backward propagation.
+
+### Implication for Product
+
+The ane-finetune value proposition shifts from "fine-tune on any data" to "**adapt within a domain**":
+- Fine-tune a children's story model on YOUR children's stories → works
+- Fine-tune on private notes in similar style → likely works
+- Fine-tune a story model to write Shakespeare → does not work
+- Cross-domain transfer (stories → code, stories → technical writing) → likely fails
+
+This narrows the product scope but doesn't kill it. The privacy story still holds for in-domain adaptation. But the base model must already be trained on similar data to the fine-tuning target.
+
 ## Honest Risks
 
-1. **110M might be too small to be useful.** TinyStories was specifically designed for tiny models. Real-world domains (code, technical writing, conversation) may require 350M+ for the fine-tuned model to produce coherent, useful output. We won't know until we test.
+1. **fp16 backward limits fine-tuning to near-distribution data.** (CONFIRMED) Cross-domain fine-tuning fails due to gradient precision loss. The model must already have reasonable loss on the target data (< ~5 CE) for stable training.
 
-2. **fp16-only training limits quality.** The entire forward/backward runs in fp16 on ANE. This means higher gradient noise than mixed-precision training. For fine-tuning (small LR, pretrained weights), this may be fine. For training from scratch, it limits convergence.
+2. **110M might be too small to be useful.** TinyStories was specifically designed for tiny models. Real-world domains (code, technical writing, conversation) may require 350M+ for the fine-tuned model to produce coherent, useful output. We won't know until we test.
 
 3. **Compilation overhead makes short runs expensive.** The first batch pays ~6 seconds of compilation. For a 1000-step fine-tune at 74ms/step, that's 6s compile + 74s train = 80s total. Compilation is 7.5% overhead. Acceptable, but it means "fine-tune for 10 steps to test" is dominated by compilation.
 
