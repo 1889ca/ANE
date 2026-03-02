@@ -450,21 +450,61 @@ Total: ~504 locks/step → ~264 locks/step, saving ~240 lock/unlock pairs.
 
 ---
 
+## 14. Tiled cls_bwd: 4×8K Input Channel Split
+
+**Commit:** `5d23882` — "Tiled cls_bwd: split 32K→4×8K input channels, 14.4→4.0ms (3.6×)"
+
+**What:** Replaced `gen_cls_bwd()` (single `[768, 32000, 1, 1]` conv) with `gen_cls_bwd_tiled()` that splits the 32K input channels into 4 chunks of 8K:
+- 4 × `slice_by_size` to extract `[1, 8000, 1, 256]` from input
+- 4 × `conv` with weights `[768, 8000, 1, 1]` each
+- Pairwise add tree: `(c0+c1) + (c2+c3)` → output `[1, 768, 1, 256]`
+
+All within a single MIL program (single `ane_eval`). Weight blobs built from 4 slices of the embed matrix via `build_blob_t(embed + t*chunk*DIM, chunk, DIM)`.
+
+**Three modes benchmarked** (via temporary `--cls-bwd-mode` flag, now removed):
+
+| Mode | Description | cls_bwd | ms/step |
+|---|---|---|---|
+| 0 | Original ANE `[768, 32000, 1, 1]` | 14.4 ms | 86.4 |
+| 1 | Tiled ANE 4×`[768, 8000, 1, 1]` | **4.2 ms** | **69.0** |
+| 2 | CPU `cblas_sgemm` (M=768, N=256, K=32000) | 11.6 ms | 89.6 |
+
+**Key findings:**
+- ANE pathology scales super-linearly with input channels: 32K channels = 14.4ms, but 4×8K channels + add tree = 4.2ms (3.4× faster despite identical FLOPs + overhead of slicing and adding).
+- CPU AMX sgemm (11.6ms) was slower than even the original ANE (14.4ms) once you add the IO overhead of `io_write_fp16_at` for rmsBwdFinal (no `cls_bwd->ioOut` to `io_copy` from).
+- The tiled kernel also compiles faster (4811ms vs 5328ms for original).
+- Mode 1 hardcoded as winner. Original `gen_cls_bwd()` removed.
+
+**Result (20 steps, accum=50, final hardcoded run):**
+```
+76.1 ms/step
+  fwd: ane=9.8 io=5.0 cls=1.0 rms_fwd=0.1
+  bwd: ane=25.7 io=16.2 cls_bwd=4.0
+  elem=12.9 [xent=5.0 memcpy=2.2 rms_bwd=2.8 resid=1.5 embed=1.0 embed_bwd=0.4]
+  dW sgemm: ffn=141 wo=17 qkv=47 embed=16 total=222 ms/step (~2.9x overlap)
+```
+
+**Correctness:** Loss identical across all 3 modes (step 0: 4.3108, step 10: 3.6026).
+
+**Files changed:** `stories_mil.h` (gen_cls_bwd_tiled replacing gen_cls_bwd), `train_large.m` (tiled compile with 4 weight slices)
+
+---
+
 ## Remaining Optimization Targets
 
-Current profile (20 steps, accum=50, post IO batching):
+Current profile (20 steps, accum=50, post tiled cls_bwd):
 ```
-~77ms/step
-  fwd: ane=10.0 io=4.5 cls=1.1 rms_fwd=0.1   (15.7 total)
-  bwd: ane=22.6 io=13.4 cls_bwd=14.0          (50.0 total)
-  elem=10.6 [xent=5.1 memcpy=1.3 rms_bwd=2.1 resid=0.8 embed=1.0 embed_bwd=0.3]
-  dW sgemm: ffn=182 wo=21 qkv=57 embed=19 total=278 ms/step (~3.6x overlap)
+~76ms/step
+  fwd: ane=9.8 io=5.0 cls=1.0 rms_fwd=0.1   (15.9 total)
+  bwd: ane=25.7 io=16.2 cls_bwd=4.0          (45.9 total)
+  elem=12.9 [xent=5.0 memcpy=2.2 rms_bwd=2.8 resid=1.5 embed=1.0 embed_bwd=0.4]
+  dW sgemm: ffn=141 wo=17 qkv=47 embed=16 total=222 ms/step (~2.9x overlap)
 ```
 
 ### Prioritized by risk-adjusted impact
 
-1. **cls_bwd ~14ms (18%)** — Single most expensive ANE kernel. Huge asymmetry: cls_fwd=1ms for same FLOP count (6.3 GFLOP). Root cause: 32000 input channels force ANE to serialize data loading. Options: (a) split into 4 tiled convs of [768, 8000, 1, 1] + add results, (b) try CPU cblas_sgemm with AMX. **~8-12ms potential, medium risk.**
-2. **Fuse sdpaBwd1+sdpaBwd2 (~7ms ane+io)** — Currently 2 separate ANE evals + IO shuffle between them, per layer. Fusion eliminates 12 ane_eval calls (~4ms) and 12 inter-kernel IO transfers (~3ms). Requires combining two MIL programs into one. **~7ms potential, high risk (MIL complexity).**
-3. **bwd io ~13ms** — Lock batching eliminated overhead, but actual data movement (memcpy + fp16↔fp32) remains. Some backward flows do unnecessary fp16→fp32→fp16 round-trips (e.g., dx_ffn read as fp32, then written back as fp16 for rmsBwd). Could keep fp16 end-to-end for pass-through data. **~3-5ms potential, medium risk.**
-4. **bwd ane ~23ms** — 74 ANE evals at ~0.31ms each. Beyond SDPA fusion, could merge qkvBwd+rmsBwd into single kernel. **~3ms additional potential, high risk.**
-5. **elem ~11ms** — xent=5.1 (CPU gradient after ANE softmax), rms_bwd=2.1, memcpy=1.3. Diminishing returns individually.
+1. **Fuse sdpaBwd1+sdpaBwd2 (~7ms ane+io)** — Currently 2 separate ANE evals + IO shuffle between them, per layer. Fusion eliminates 12 ane_eval calls (~4ms) and 12 inter-kernel IO transfers (~3ms). Requires combining two MIL programs into one. **~7ms potential, high risk (MIL complexity).**
+2. **bwd io ~16ms** — Lock batching eliminated overhead, but actual data movement (memcpy + fp16↔fp32) remains. Some backward flows do unnecessary fp16→fp32→fp16 round-trips (e.g., dx_ffn read as fp32, then written back as fp16 for rmsBwd). Could keep fp16 end-to-end for pass-through data. **~3-5ms potential, medium risk.**
+3. **bwd ane ~26ms** — 74 ANE evals at ~0.35ms each. Beyond SDPA fusion, could merge qkvBwd+rmsBwd into single kernel. **~3ms additional potential, high risk.**
+4. **elem ~13ms** — xent=5.0 (CPU gradient after ANE softmax), rms_bwd=2.8, memcpy=2.2. Diminishing returns individually.
+5. **cls_bwd ~4ms** — Could try 8×4K tiling for further reduction, but diminishing returns from current 4.0ms.
