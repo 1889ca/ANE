@@ -346,6 +346,17 @@ static NSString *gen_rms_bwd(void) {
     return m;
 }
 
+// Softmax kernel (weight-free): softmax(axis=1) on [1, VOCAB, 1, SEQ]
+static NSString *gen_softmax(void) {
+    NSMutableString *m = [NSMutableString string];
+    [m appendString:MIL_HDR];
+    [m appendFormat:@"    func main<ios18>(tensor<fp16, [1, %d, 1, %d]> x) {\n", VOCAB, SEQ];
+    [m appendString:@"        int32 sax = const()[name=string(\"sax\"), val=int32(1)];\n"];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> out = softmax(axis=sax,x=x)[name=string(\"sm\")];\n", VOCAB, SEQ];
+    [m appendString:@"    } -> (out);\n}\n"];
+    return m;
+}
+
 // Mask blob (causal mask [SEQ,SEQ])
 static NSData *g_mask_blob = nil;
 static NSData *get_mask_blob(void) {

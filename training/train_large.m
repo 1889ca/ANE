@@ -336,6 +336,12 @@ int main(int argc, char *argv[]) {
         Kern *cls_fwd = NULL, *cls_bwd = NULL;
         bool use_ane_cls = true;
 
+        // Softmax ANE kernel (weight-free, compiled once)
+        Kern *softmax_kern = compile_kern_mil_w(gen_softmax(), @{},
+            VOCAB*SEQ*2, VOCAB*SEQ*2);
+        bool use_ane_softmax = (softmax_kern != NULL);
+        if (!use_ane_softmax) printf("  [softmax] ANE compile failed, falling back to CPU\n");
+
         // Per-layer serial queues allow different layers' dW to run in parallel
         // while serializing same-layer dW across steps (protects gradient accumulators)
         dispatch_queue_t dw_layer_q[NLAYERS];
@@ -359,6 +365,7 @@ int main(int argc, char *argv[]) {
                 for (int L=0; L<NLAYERS; L++) { free_layer_kernels(&kern[L]); free_kern(sdpaBwd2[L]); free_kern(kern[L].rmsBwd); kern[L].rmsBwd = NULL; }
                 free_kern(rmsBwdFinal); rmsBwdFinal = NULL;
                 free_kern(cls_fwd); free_kern(cls_bwd); cls_fwd = cls_bwd = NULL;
+                free_kern(softmax_kern); softmax_kern = NULL;
                 double wall = tb_ms(mach_absolute_time() - t_wall_start);
                 save_checkpoint(CKPT_PATH, step, total_steps, lr, last_loss,
                     total_compile_ms+cum_compile, total_train_ms+cum_train, wall+cum_wall,
@@ -419,6 +426,11 @@ int main(int argc, char *argv[]) {
             if (!rmsBwdFinal) {
                 rmsBwdFinal = compile_rms_bwd();
                 if (!rmsBwdFinal) { printf("rmsBwdFinal recompile failed\n"); return 1; }
+            }
+            if (!softmax_kern && use_ane_softmax) {
+                softmax_kern = compile_kern_mil_w(gen_softmax(), @{},
+                    VOCAB*SEQ*2, VOCAB*SEQ*2);
+                if (!softmax_kern) { printf("  [softmax] recompile failed, falling back to CPU\n"); use_ane_softmax = false; }
             }
 
             // Compile classifier ANE kernels (embed weights change each batch)
@@ -515,11 +527,10 @@ int main(int argc, char *argv[]) {
                 rmsnorm(x_final, x_cur, rms_final, rrms_final, DIM, SEQ);
                 t1=mach_absolute_time(); t_rms+=tb_ms(t1-t0); t0=t1;
 
-                // Classifier: logits = embed @ x_final
+                // Classifier forward: logits = embed @ x_final
                 if (use_ane_cls) {
                     io_write_fp16(cls_fwd->ioIn, x_final, DIM, SEQ);
                     ane_eval(cls_fwd);
-                    io_read_fp16(cls_fwd->ioOut, logits, 0, VOCAB, SEQ);
                 } else {
                     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                                 VOCAB, SEQ, DIM, 1.0f,
@@ -527,16 +538,32 @@ int main(int argc, char *argv[]) {
                 }
                 t1=mach_absolute_time(); t_cls+=tb_ms(t1-t0); t0=t1;
 
-                // Cross-entropy loss
-                float loss = cross_entropy_loss(dlogits, logits, target_tokens, VOCAB, SEQ);
+                // Cross-entropy: softmax on ANE, loss+gradient on CPU
+                float loss;
+                if (use_ane_softmax && use_ane_cls) {
+                    io_copy(softmax_kern->ioIn, 0, cls_fwd->ioOut, 0, VOCAB, SEQ);
+                    ane_eval(softmax_kern);
+                    io_read_fp16(softmax_kern->ioOut, dlogits, 0, VOCAB, SEQ);
+                    // Loss: read target probabilities (256 lookups)
+                    float total_loss = 0;
+                    for (int t = 0; t < SEQ; t++)
+                        total_loss -= logf(dlogits[target_tokens[t]*SEQ + t] + 1e-10f);
+                    loss = total_loss / SEQ;
+                    // Gradient: dlogits = probs/S, correct at target positions
+                    float invS = 1.0f / SEQ;
+                    vDSP_vsmul(dlogits, 1, &invS, dlogits, 1, (vDSP_Length)(VOCAB*SEQ));
+                    for (int t = 0; t < SEQ; t++)
+                        dlogits[target_tokens[t]*SEQ + t] -= invS;
+                } else {
+                    if (use_ane_cls)
+                        io_read_fp16(cls_fwd->ioOut, logits, 0, VOCAB, SEQ);
+                    loss = cross_entropy_loss(dlogits, logits, target_tokens, VOCAB, SEQ);
+                }
                 last_loss = loss;
                 t1=mach_absolute_time(); t_xent+=tb_ms(t1-t0); t0=t1;
 
                 // ===== BACKWARD =====
-                // dlogits already computed by cross_entropy_loss
-
-                // Classifier backward: dx_final = embed^T @ dlogits, dembed += dlogits @ x_final^T
-                // dx_final[DIM,SEQ] = embed^T[DIM,VOCAB] @ dlogits[VOCAB,SEQ]
+                // Classifier backward: dx_final = embed^T @ dlogits
                 if (use_ane_cls) {
                     io_write_fp16(cls_bwd->ioIn, dlogits, VOCAB, SEQ);
                     ane_eval(cls_bwd);
@@ -781,6 +808,7 @@ int main(int argc, char *argv[]) {
 
         // Cleanup
         free_kern(cls_fwd); free_kern(cls_bwd);
+        free_kern(softmax_kern);
         free_kern(rmsBwdFinal);
         for (int L=0; L<NLAYERS; L++) {
             free_layer_kernels(&kern[L]);
