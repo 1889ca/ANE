@@ -533,24 +533,77 @@ Both produce coherent children's story fragments. The trained model shows slight
 
 ---
 
+## 16. CPU RoPE: Split Forward Kernel + Positional Encoding
+
+**Commit:** `20c31d0` — "Add CPU-based RoPE to ANE training pipeline"
+
+**What:** Added Rotary Position Embeddings (RoPE) to fix the #1 quality bottleneck. The fused `gen_sdpa_fwd_taps()` kernel (RMSNorm → QKV → SDPA → Wo → residual) had to be split because RoPE goes between QKV projection and attention.
+
+**Architecture change:**
+- **Deleted** `gen_sdpa_fwd_taps()` (1 kernel, 6 weights)
+- **Added** `gen_qkv_fwd_taps()` (RMSNorm + QKV, 4 weights) → outputs `[Q, K, V, xnorm, rrms]`
+- **Added** `gen_attn_fwd()` (SDPA + Wo + residual, 2 weights) → takes `[Q_rope, K_rope, V, x_residual]`, outputs `[x2, attn_out]`
+- **CPU bridge:** `cpu_rope_cf()` / `cpu_rope_backward_cf()` — channel-first `[DIM, SEQ]` layout, loop order heads → dim pairs → positions (inner) for cache-friendly row access (each row = 256 floats = 1KB, fits L1)
+- `KERNELS_PER_LAYER` 5→6, `LayerKernels` gets `qkvFwd` + `attnFwd` replacing `fwdAttn`
+
+**Forward flow per layer:**
+1. `qkvFwd` ANE eval → read Q,K to fp32
+2. `cpu_rope_cf(Q, K)` — in-place rotation
+3. Write RoPE'd Q,K (fp32→fp16) + V (fp16 copy) + x_residual (fp32→fp16) to `attnFwd->ioIn`
+4. `attnFwd` ANE eval → x2 to FFN, attn_out to dwcap
+
+**Backward flow:**
+- sdpaBwd1/sdpaBwd2 receive RoPE'd Q,K from `attnFwd->ioIn` (correct for recomputing attention scores)
+- After sdpaBwd2: `cpu_rope_backward_cf(dQ, dK)` rotates gradients back to pre-RoPE space
+- Pre-RoPE dQ,dK used for both dW sgemm (`dWq = dq @ xnorm^T`) and qkvBwd (`dx = Wq^T @ dq + ...`)
+
+**Result (20 steps, accum=50):**
+```
+90.5 ms/step
+  fwd: ane=11.4 io=10.3 cls=1.0 rms_fwd=0.1
+  bwd: ane=25.3 io=26.1 cls_bwd=3.9
+  elem=11.1 [xent=4.6 memcpy=1.3 rms_bwd=2.5 resid=1.2 embed=1.2 embed_bwd=0.3]
+  dW sgemm: ffn=122 wo=13 qkv=39 embed=18 total=191 ms/step
+```
+
+| Metric | Before (no RoPE) | After (with RoPE) | Change |
+|---|---|---|---|
+| ms/step | 76 | 90.5 | +14.5ms |
+| fwd ane | 9.8 | 11.4 | +1.6ms (extra ANE eval) |
+| fwd io | 5.0 | 10.3 | +5.3ms (Q,K fp16↔fp32 + RoPE) |
+| bwd io | 16.2 | 26.1 | +9.9ms (rope_backward + fp32→fp16 for qkvBwd) |
+| loss step 0 | ~4.31 | **0.82** | Pretrained weights now match |
+
+**Quality impact — dramatic:**
+- Step 0 loss dropped from 4.31 to 0.82 because the pretrained stories110M weights were trained *with* RoPE. Without RoPE the model was effectively scrambled.
+- Text generation: fully coherent stories with dialogue, narrative flow, character consistency. No more mid-sequence repetition ("swim in the swim").
+
+**Training run (1000 steps, lr=3e-5, warmup=50, cosine→1e-5):**
+- Loss stable in 0.6-0.9 range throughout, no divergence
+- Text generation quality matches pretrained baseline
+
+**Files changed:** `stories_cpu_ops.h` (cpu_rope_cf, cpu_rope_backward_cf), `stories_mil.h` (gen_qkv_fwd_taps, gen_attn_fwd replacing gen_sdpa_fwd_taps), `stories_config.h` (LayerKernels, KERNELS_PER_LAYER), `train_large.m` (compile/free/forward/backward rewiring), `generate.py` (apply_rope)
+
+---
+
 ## Remaining Optimization Targets
 
-Current profile (20 steps, accum=50, post tiled cls_bwd):
+Current profile (20 steps, accum=50, post RoPE):
 ```
-~76ms/step
-  fwd: ane=9.8 io=5.0 cls=1.0 rms_fwd=0.1   (15.9 total)
-  bwd: ane=25.7 io=16.2 cls_bwd=4.0          (45.9 total)
-  elem=12.9 [xent=5.0 memcpy=2.2 rms_bwd=2.8 resid=1.5 embed=1.0 embed_bwd=0.4]
-  dW sgemm: ffn=141 wo=17 qkv=47 embed=16 total=222 ms/step (~2.9x overlap)
+~90ms/step
+  fwd: ane=11.4 io=10.3 cls=1.0 rms_fwd=0.1   (22.8 total)
+  bwd: ane=25.3 io=26.1 cls_bwd=3.9            (55.3 total)
+  elem=11.1 [xent=4.6 memcpy=1.3 rms_bwd=2.5 resid=1.2 embed=1.2 embed_bwd=0.3]
+  dW sgemm: ffn=122 wo=13 qkv=39 embed=18 total=191 ms/step
 ```
 
 ### Prioritized by risk-adjusted impact
 
-1. **Fuse sdpaBwd1+sdpaBwd2 (~7ms ane+io)** — Currently 2 separate ANE evals + IO shuffle between them, per layer. Fusion eliminates 12 ane_eval calls (~4ms) and 12 inter-kernel IO transfers (~3ms). Requires combining two MIL programs into one. **~7ms potential, high risk (MIL complexity).**
-2. **bwd io ~16ms** — Lock batching eliminated overhead, but actual data movement (memcpy + fp16↔fp32) remains. Some backward flows do unnecessary fp16→fp32→fp16 round-trips (e.g., dx_ffn read as fp32, then written back as fp16 for rmsBwd). Could keep fp16 end-to-end for pass-through data. **~3-5ms potential, medium risk.**
-3. **bwd ane ~26ms** — 74 ANE evals at ~0.35ms each. Beyond SDPA fusion, could merge qkvBwd+rmsBwd into single kernel. **~3ms additional potential, high risk.**
-4. **elem ~13ms** — xent=5.0 (CPU gradient after ANE softmax), rms_bwd=2.8, memcpy=2.2. Diminishing returns individually.
-5. **cls_bwd ~4ms** — Could try 8×4K tiling for further reduction, but diminishing returns from current 4.0ms.
+1. **RoPE IO overhead (~15ms)** — The fp16→fp32→RoPE→fp32→fp16 round-trip adds ~15ms (fwd io +5.3, bwd io +9.9). Options: (a) precompute sin/cos tables (eliminate powf/cosf/sinf per call), (b) NEON fp16 RoPE (skip fp32 roundtrip entirely), (c) fuse fp16→fp32→RoPE→fp16 into single NEON pass per dim pair. **~8-12ms potential, low-medium risk.**
+2. **Fuse sdpaBwd1+sdpaBwd2 (~7ms ane+io)** — Currently 2 separate ANE evals + IO shuffle between them, per layer. Fusion eliminates 12 ane_eval calls (~4ms) and 12 inter-kernel IO transfers (~3ms). Requires combining two MIL programs into one. **~7ms potential, high risk (MIL complexity).**
+3. **bwd io ~26ms** — Lock batching eliminated overhead, but actual data movement (memcpy + fp16↔fp32) remains. Some backward flows do unnecessary fp16→fp32→fp16 round-trips. **~3-5ms potential, medium risk.**
+4. **bwd ane ~25ms** — 86 ANE evals (12 extra from RoPE split). Beyond SDPA fusion, could merge qkvBwd+rmsBwd into single kernel. **~3ms additional potential, high risk.**
+5. **elem ~11ms** — xent=4.6, rms_bwd=2.5, memcpy=1.3. Diminishing returns individually.
 
 ---
 
@@ -564,7 +617,7 @@ Current profile (20 steps, accum=50, post tiled cls_bwd):
 
 ### Structural ceilings
 
-1. **No RoPE = no real positional understanding.** Causal masking provides weak implicit position signal, but the model can't learn position-dependent patterns. This is the #1 quality bottleneck. Adding RoPE to MIL requires sin/cos lookup tables + elementwise ops in the SDPA kernel (both forward and backward). Feasible but significant.
+1. **RoPE added (solved).** CPU-based RoPE between split QKV/attention kernels. +14.5ms overhead from fp16↔fp32 conversions. Could be optimized with NEON fp16 RoPE or precomputed sin/cos tables.
 
 2. **fp16-only compute path caps LR at ~3e-5.** The entire forward/backward runs in fp16 on ANE. Only gradient accumulation and adam state are fp32. This means gradient noise is much higher than mixed-precision training (where forward activations are fp16 but backward accumulation uses fp32 master weights). The practical effect: training converges slowly and can't use aggressive LR schedules.
 
