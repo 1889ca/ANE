@@ -25,6 +25,11 @@
 #define DEFAULT_ACCUM_STEPS 50
 #define DEFAULT_MAX_COMPILES 200
 
+// Loss scaling: prevents fp16 gradient underflow in ANE backward kernels
+// Gradients (~8e-5) × weights (~0.036) → products flush to zero in fp16
+// Scale up before ANE backward, divide out before Adam update
+#define LOSS_SCALE 256.0f
+
 // Per compile: 6 weight-bearing kernels per layer + 1 classifier = 6*12+1 = 73
 // Plus 1 static (sdpaBwd2 per layer, no weights) = 12 more but those are weight-free
 // Weight-bearing: qkvFwd(1) + attnFwd(1) + fwdFFN(1) + ffnBwd(1) + sdpaBwd1(1) + qkvBwd(1) = 6 per layer

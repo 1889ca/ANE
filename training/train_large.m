@@ -331,6 +331,12 @@ int main(int argc, char *argv[]) {
         uint16_t *token_data = (uint16_t*)mmap(NULL, data_len, PROT_READ, MAP_PRIVATE, data_fd, 0);
         if (token_data == MAP_FAILED) { printf("mmap failed\n"); return 1; }
         size_t n_tokens = data_len / 2;
+        if (n_tokens <= (size_t)(SEQ + 1)) {
+            printf("Token data too short: need at least %d tokens, got %zu\n", SEQ + 2, n_tokens);
+            munmap(token_data, data_len);
+            close(data_fd);
+            return 1;
+        }
         printf("Token data: %zu tokens (%.1f MB)\n", n_tokens, data_len/1e6);
 
         // Gradient buffers shared across layers (reused each step)
@@ -642,6 +648,9 @@ int main(int argc, char *argv[]) {
                     loss = cross_entropy_loss(dlogits, logits, target_tokens, VOCAB, SEQ);
                 }
                 last_loss = loss;
+                // Loss scaling: amplify gradients before they enter fp16 ANE backward
+                float ls = LOSS_SCALE;
+                vDSP_vsmul(dlogits, 1, &ls, dlogits, 1, (vDSP_Length)((size_t)VOCAB*SEQ));
                 t1=mach_absolute_time(); t_xent+=tb_ms(t1-t0); t0=t1;
 
                 // ===== BACKWARD =====
@@ -933,8 +942,8 @@ int main(int argc, char *argv[]) {
                 cur_lr = lr_min + 0.5f * (lr - lr_min) * (1.0f + cosf(M_PI * progress));
             }
 
-            // Adam update (scale gradients by 1/steps_batch, then clip grad norm)
-            float gsc = 1.0f / steps_batch;
+            // Adam update (scale gradients by 1/(steps_batch * LOSS_SCALE), then clip grad norm)
+            float gsc = 1.0f / (steps_batch * LOSS_SCALE);
             adam_t++;
             for (int L=0; L<NLAYERS; L++) {
                 LayerGrads *g = &grads[L];
@@ -995,20 +1004,21 @@ int main(int argc, char *argv[]) {
                 printf("    [grad_clip: norm=%.1f → %.1f]\n", grad_norm, max_grad_norm);
             }
 
+            float wd = 0.1f;
             for (int L=0; L<NLAYERS; L++) {
                 LayerGrads *g = &grads[L];
-                adam_update(lw[L].Wq, g->Wq, &la[L].Wq, adam_t, cur_lr, adam_b1, adam_b2, adam_eps);
-                adam_update(lw[L].Wk, g->Wk, &la[L].Wk, adam_t, cur_lr, adam_b1, adam_b2, adam_eps);
-                adam_update(lw[L].Wv, g->Wv, &la[L].Wv, adam_t, cur_lr, adam_b1, adam_b2, adam_eps);
-                adam_update(lw[L].Wo, g->Wo, &la[L].Wo, adam_t, cur_lr, adam_b1, adam_b2, adam_eps);
-                adam_update(lw[L].W1, g->W1, &la[L].W1, adam_t, cur_lr, adam_b1, adam_b2, adam_eps);
-                adam_update(lw[L].W2, g->W2, &la[L].W2, adam_t, cur_lr, adam_b1, adam_b2, adam_eps);
-                adam_update(lw[L].W3, g->W3, &la[L].W3, adam_t, cur_lr, adam_b1, adam_b2, adam_eps);
-                adam_update(lw[L].rms_att, g->rms_att, &la[L].rms_att, adam_t, cur_lr, adam_b1, adam_b2, adam_eps);
-                adam_update(lw[L].rms_ffn, g->rms_ffn, &la[L].rms_ffn, adam_t, cur_lr, adam_b1, adam_b2, adam_eps);
+                adam_update(lw[L].Wq, g->Wq, &la[L].Wq, adam_t, cur_lr, adam_b1, adam_b2, adam_eps, wd);
+                adam_update(lw[L].Wk, g->Wk, &la[L].Wk, adam_t, cur_lr, adam_b1, adam_b2, adam_eps, wd);
+                adam_update(lw[L].Wv, g->Wv, &la[L].Wv, adam_t, cur_lr, adam_b1, adam_b2, adam_eps, wd);
+                adam_update(lw[L].Wo, g->Wo, &la[L].Wo, adam_t, cur_lr, adam_b1, adam_b2, adam_eps, wd);
+                adam_update(lw[L].W1, g->W1, &la[L].W1, adam_t, cur_lr, adam_b1, adam_b2, adam_eps, wd);
+                adam_update(lw[L].W2, g->W2, &la[L].W2, adam_t, cur_lr, adam_b1, adam_b2, adam_eps, wd);
+                adam_update(lw[L].W3, g->W3, &la[L].W3, adam_t, cur_lr, adam_b1, adam_b2, adam_eps, wd);
+                adam_update(lw[L].rms_att, g->rms_att, &la[L].rms_att, adam_t, cur_lr, adam_b1, adam_b2, adam_eps, 0.0f);
+                adam_update(lw[L].rms_ffn, g->rms_ffn, &la[L].rms_ffn, adam_t, cur_lr, adam_b1, adam_b2, adam_eps, 0.0f);
             }
-            adam_update(rms_final, grms_final, &arms_final, adam_t, cur_lr, adam_b1, adam_b2, adam_eps);
-            adam_update(embed, gembed_cls, &aembed, adam_t, cur_lr, adam_b1, adam_b2, adam_eps);
+            adam_update(rms_final, grms_final, &arms_final, adam_t, cur_lr, adam_b1, adam_b2, adam_eps, 0.0f);
+            adam_update(embed, gembed_cls, &aembed, adam_t, cur_lr, adam_b1, adam_b2, adam_eps, wd);
 
             printf("  [batch %d: compile=%.0fms train=%.1fms (%.1fms/step) compiles=%d lr=%.2e]\n",
                    steps_batch, cms, tms, tms/steps_batch, g_compile_count, cur_lr);

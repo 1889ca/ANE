@@ -34,13 +34,13 @@ static void rmsnorm_dw(float *dw, const float *dy, const float *x, const float *
     }
 }
 
-static void adam_update(float *w, const float *g, AdamState *s, int t, float lr, float b1, float b2, float eps) {
+static void adam_update(float *w, const float *g, AdamState *s, int t, float lr, float b1, float b2, float eps, float wd) {
     float bc1 = 1.0f - powf(b1, t), bc2 = 1.0f - powf(b2, t);
     for (size_t i=0; i<s->n; i++) {
         s->m[i] = b1*s->m[i] + (1-b1)*g[i];
         s->v[i] = b2*s->v[i] + (1-b2)*g[i]*g[i];
         float mh = s->m[i]/bc1, vh = s->v[i]/bc2;
-        w[i] -= lr * mh / (sqrtf(vh) + eps);
+        w[i] -= lr * (mh / (sqrtf(vh) + eps) + wd * w[i]);
     }
 }
 
@@ -244,6 +244,7 @@ static void neon_rope_bwd_f16(const _Float16 *src, _Float16 *dst,
 static void embed_lookup(float *x, const float *embed, const uint16_t *tokens, int dim, int seq) {
     for (int t = 0; t < seq; t++) {
         int tok = tokens[t];
+        if (tok < 0 || tok >= VOCAB) { fprintf(stderr, "WARN: token %d out of range [0,%d)\n", tok, VOCAB); continue; }
         for (int d = 0; d < dim; d++) {
             x[d*seq + t] = embed[tok*dim + d];
         }
@@ -254,6 +255,7 @@ static void embed_lookup(float *x, const float *embed, const uint16_t *tokens, i
 static void embed_backward(float *d_embed, const float *dx, const uint16_t *tokens, int dim, int seq) {
     for (int t = 0; t < seq; t++) {
         int tok = tokens[t];
+        if (tok < 0 || tok >= VOCAB) { continue; }
         for (int d = 0; d < dim; d++) {
             d_embed[tok*dim + d] += dx[d*seq + t];
         }
