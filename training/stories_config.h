@@ -99,8 +99,10 @@ typedef struct {
     float *dq[2];           // [DIM, SEQ] — written directly by neon_rope_bwd
     float *dk[2];           // [DIM, SEQ]
     float *dv[2];           // [DIM, SEQ]
-    // Gradients: memcpy from main-thread buffers (already fp32)
-    float *dffn[2];         // [DIM, SEQ]
+    // Gradients: fp16 from fused rmsBwd_resid output, cvt in async dW
+    _Float16 *dffn_f16[2];  // [DIM, SEQ] — from rmsBwd1 fused output
+    _Float16 *dx2_f16[2];   // [DIM, SEQ] — from rmsBwd2 fused output
+    float *dffn[2];         // [DIM, SEQ] — fp32 conversion target
     float *dx2[2];          // [DIM, SEQ]
     dispatch_semaphore_t sem;
 } LayerDWCap;
@@ -115,7 +117,8 @@ typedef struct {
 // ANE kernels per layer
 typedef struct { void *model; IOSurfaceRef ioIn, ioOut; void *request; void *tmpDir; } Kern;
 typedef struct {
-    Kern *qkvFwd, *attnFwd, *fwdFFN, *ffnBwd, *sdpaBwd1, *sdpaBwd2, *qkvBwd, *rmsBwd;
+    Kern *qkvFwd, *attnFwd, *fwdFFN, *ffnBwd, *sdpaBwd1, *sdpaBwd2, *qkvBwd;
+    Kern *rmsBwd1, *rmsBwd2;  // fused residual add: rmsBwd2=FFN side, rmsBwd1=QKV side
 } LayerKernels;
 
 // Checkpoint header
@@ -204,6 +207,8 @@ static LayerDWCap layer_dwcap_alloc(void) {
         c.dh1_f16[s]=(_Float16*)malloc(SEQ*HIDDEN*2);
         c.dh3_f16[s]=(_Float16*)malloc(SEQ*HIDDEN*2);
         c.dv_f16[s]=(_Float16*)malloc(SEQ*DIM*2);
+        c.dffn_f16[s]=(_Float16*)malloc(SEQ*DIM*2);
+        c.dx2_f16[s]=(_Float16*)malloc(SEQ*DIM*2);
         // fp32 conversion targets (written in async dW path)
         c.silu_out[s]=(float*)malloc(SEQ*HIDDEN*4);
         c.x2norm[s]=(float*)malloc(SEQ*DIM*4);
@@ -225,6 +230,7 @@ static void layer_dwcap_free(LayerDWCap *c) {
         free(c->silu_f16[s]);free(c->x2norm_f16[s]);
         free(c->attn_f16[s]);free(c->xnorm_f16[s]);
         free(c->dh1_f16[s]);free(c->dh3_f16[s]);free(c->dv_f16[s]);
+        free(c->dffn_f16[s]);free(c->dx2_f16[s]);
         free(c->silu_out[s]);free(c->x2norm[s]);
         free(c->attn_out[s]);free(c->xnorm[s]);
         free(c->dh1[s]);free(c->dh3[s]);

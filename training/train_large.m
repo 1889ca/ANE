@@ -101,6 +101,11 @@ static Kern *compile_rms_bwd(void) {
     return compile_kern_mil_w(gen_rms_bwd(), @{},
         3*DIM*SEQ*2, DIM*SEQ*2);
 }
+// Compile weight-free rmsBwd with fused residual add
+static Kern *compile_rms_bwd_resid(void) {
+    return compile_kern_mil_w(gen_rms_bwd_resid(), @{},
+        4*DIM*SEQ*2, DIM*SEQ*2);
+}
 
 // Compile weight-free sdpaBwd2 (only needs once, no weights)
 static Kern *compile_sdpa_bwd2(void) {
@@ -112,7 +117,7 @@ static void free_layer_kernels(LayerKernels *lk) {
     free_kern(lk->qkvFwd); free_kern(lk->attnFwd);
     free_kern(lk->fwdFFN); free_kern(lk->ffnBwd);
     free_kern(lk->sdpaBwd1); free_kern(lk->qkvBwd);
-    // sdpaBwd2, rmsBwd are shared/static, freed separately
+    // sdpaBwd2, rmsBwd1, rmsBwd2 are shared/static, freed separately
     lk->qkvFwd = lk->attnFwd = lk->fwdFFN = lk->ffnBwd = lk->sdpaBwd1 = lk->qkvBwd = NULL;
 }
 
@@ -361,10 +366,11 @@ int main(int argc, char *argv[]) {
             if (!sdpaBwd2[L]) { printf("sdpaBwd2 compile failed\n"); return 1; }
         }
 
-        // Compile static rmsBwd kernels (no weights, one per layer + 1 final)
+        // Compile rmsBwd kernels: resid variant per layer (fused residual add), plain for final
         for (int L=0; L<NLAYERS; L++) {
-            kern[L].rmsBwd = compile_rms_bwd();
-            if (!kern[L].rmsBwd) { printf("rmsBwd compile failed at layer %d\n", L); return 1; }
+            kern[L].rmsBwd2 = compile_rms_bwd_resid();
+            kern[L].rmsBwd1 = compile_rms_bwd_resid();
+            if (!kern[L].rmsBwd2 || !kern[L].rmsBwd1) { printf("rmsBwd compile failed at layer %d\n", L); return 1; }
         }
         Kern *rmsBwdFinal = compile_rms_bwd();
         if (!rmsBwdFinal) { printf("rmsBwdFinal compile failed\n"); return 1; }
@@ -399,7 +405,7 @@ int main(int argc, char *argv[]) {
         while (step < total_steps) {
             // Check compile budget
             if (g_compile_count + TOTAL_WEIGHT_KERNELS + (use_ane_cls ? CLS_KERNELS : 0) > max_compiles) {
-                for (int L=0; L<NLAYERS; L++) { free_layer_kernels(&kern[L]); free_kern(sdpaBwd2[L]); free_kern(kern[L].rmsBwd); kern[L].rmsBwd = NULL; }
+                for (int L=0; L<NLAYERS; L++) { free_layer_kernels(&kern[L]); free_kern(sdpaBwd2[L]); free_kern(kern[L].rmsBwd2); kern[L].rmsBwd2 = NULL; free_kern(kern[L].rmsBwd1); kern[L].rmsBwd1 = NULL; }
                 free_kern(rmsBwdFinal); rmsBwdFinal = NULL;
                 free_kern(cls_fwd); free_kern(cls_bwd); cls_fwd = cls_bwd = NULL;
                 free_kern(softmax_kern); softmax_kern = NULL;
@@ -455,9 +461,13 @@ int main(int argc, char *argv[]) {
                     sdpaBwd2[L] = compile_sdpa_bwd2();
                     if (!sdpaBwd2[L]) { printf("sdpaBwd2 recompile failed\n"); return 1; }
                 }
-                if (!kern[L].rmsBwd) {
-                    kern[L].rmsBwd = compile_rms_bwd();
-                    if (!kern[L].rmsBwd) { printf("rmsBwd recompile failed\n"); return 1; }
+                if (!kern[L].rmsBwd2) {
+                    kern[L].rmsBwd2 = compile_rms_bwd_resid();
+                    if (!kern[L].rmsBwd2) { printf("rmsBwd2 recompile failed\n"); return 1; }
+                }
+                if (!kern[L].rmsBwd1) {
+                    kern[L].rmsBwd1 = compile_rms_bwd_resid();
+                    if (!kern[L].rmsBwd1) { printf("rmsBwd1 recompile failed\n"); return 1; }
                 }
             }
             if (!rmsBwdFinal) {
@@ -716,17 +726,23 @@ int main(int argc, char *argv[]) {
                     dispatch_semaphore_wait(cap->sem, DISPATCH_TIME_FOREVER);
                     double sw=tb_ms(mach_absolute_time()-sw0); t_sem_wait+=sw; sem_wait_layer[L]+=sw; }
 
-                    // dy is the gradient at the output of this layer
+                    // dy handoff: first layer from fp32, subsequent from fused rmsBwd1 output
                     t0=mach_absolute_time();
-                    memcpy(cap->dffn[slot], dy, SEQ*DIM*4);
-                    t1=mach_absolute_time(); t_memcpy+=tb_ms(t1-t0);
 
                     // FFN backward (ANE)
-                    t0=mach_absolute_time();
-                    { // Batch: ffnBwd->ioIn (2 writes→1) + fwdFFN->ioOut (1 read)
-                    _Float16 *bwd_in = io_lock_rw(kern[L].ffnBwd->ioIn);
+                    { _Float16 *bwd_in = io_lock_rw(kern[L].ffnBwd->ioIn);
                     const _Float16 *fwd_out = io_lock_ro(kern[L].fwdFFN->ioOut);
-                    cvt_f32_f16(bwd_in, cap->dffn[slot], DIM * SEQ);
+                    if (L == NLAYERS-1) {
+                        // First backward layer: dy is fp32 from rmsBwdFinal
+                        memcpy(cap->dffn[slot], dy, SEQ*DIM*4);
+                        cvt_f32_f16(bwd_in, cap->dffn[slot], DIM * SEQ);
+                    } else {
+                        // Subsequent layers: dy is fp16 on rmsBwd1[L+1]->ioOut
+                        const _Float16 *prev_dy = io_lock_ro(kern[L+1].rmsBwd1->ioOut);
+                        memcpy(bwd_in, prev_dy, DIM * SEQ * sizeof(_Float16));
+                        memcpy(cap->dffn_f16[slot], prev_dy, DIM * SEQ * sizeof(_Float16));
+                        io_unlock_ro(kern[L+1].rmsBwd1->ioOut);
+                    }
                     memcpy(bwd_in + DIM*SEQ, fwd_out + DIM*SEQ, 2*HIDDEN * SEQ * sizeof(_Float16));
                     io_unlock_ro(kern[L].fwdFFN->ioOut);
                     io_unlock_rw(kern[L].ffnBwd->ioIn);
@@ -746,6 +762,8 @@ int main(int argc, char *argv[]) {
                     // dW FFN async — deferred fp16→fp32 conversion + sgemm
                     dispatch_group_async(layer_dw_grp, dw_layer_q[L], ^{
                         uint64_t dw0=mach_absolute_time();
+                        if (L < NLAYERS-1)
+                            cvt_f16_f32(cap->dffn[slot], cap->dffn_f16[slot], DIM * SEQ);
                         cvt_f16_f32(cap->silu_out[slot], cap->silu_f16[slot], HIDDEN * SEQ);
                         cvt_f16_f32(cap->x2norm[slot],   cap->x2norm_f16[slot], DIM * SEQ);
                         cvt_f16_f32(cap->dh1[slot],      cap->dh1_f16[slot], HIDDEN * SEQ);
@@ -759,56 +777,57 @@ int main(int argc, char *argv[]) {
                         dw_t_ffn[L]+=tb_ms(mach_absolute_time()-dw0);
                     });
 
-                    // RMSNorm2 backward: dw on CPU, dx on ANE
+                    // RMSNorm2 backward: dw on CPU, dx+resid fused on ANE (rmsBwd2)
                     t0=mach_absolute_time();
                     rmsnorm_dw(gr->rms_ffn, dx_ffn, ac->x2, ac->rrms_ffn, DIM, SEQ);
                     t1=mach_absolute_time(); t_rms_bwd+=tb_ms(t1-t0); t0=t1;
-                    { // Batch: rmsBwd->ioIn (3 writes→1) + ffnBwd->ioOut + fwdFFN->ioIn
-                    _Float16 *rms_in = io_lock_rw(kern[L].rmsBwd->ioIn);
+                    { // Pack rmsBwd2: dx_ffn, x, w, dy_skip (fused residual add)
+                    _Float16 *rms_in = io_lock_rw(kern[L].rmsBwd2->ioIn);
                     const _Float16 *ffn_bwd_p = io_lock_ro(kern[L].ffnBwd->ioOut);
                     const _Float16 *ffn_fwd_p = io_lock_ro(kern[L].fwdFFN->ioIn);
+                    const _Float16 *ffn_bwd_in = io_lock_ro(kern[L].ffnBwd->ioIn);
                     memcpy(rms_in, ffn_bwd_p, DIM * SEQ * sizeof(_Float16));
                     memcpy(rms_in + DIM*SEQ, ffn_fwd_p, DIM * SEQ * sizeof(_Float16));
-                    io_unlock_ro(kern[L].fwdFFN->ioIn);
-                    io_unlock_ro(kern[L].ffnBwd->ioOut);
                     for (int c = 0; c < DIM; c++)
                         rms_in[(2*DIM + c) * SEQ] = (_Float16)lw[L].rms_ffn[c];
-                    io_unlock_rw(kern[L].rmsBwd->ioIn);
+                    memcpy(rms_in + 3*DIM*SEQ, ffn_bwd_in, DIM * SEQ * sizeof(_Float16));
+                    io_unlock_ro(kern[L].ffnBwd->ioIn);
+                    io_unlock_ro(kern[L].fwdFFN->ioIn);
+                    io_unlock_ro(kern[L].ffnBwd->ioOut);
+                    io_unlock_rw(kern[L].rmsBwd2->ioIn);
                     }
                     t1=mach_absolute_time(); t_bwd_io+=tb_ms(t1-t0); t0=t1;
-                    ane_eval(kern[L].rmsBwd);
+                    ane_eval(kern[L].rmsBwd2);
                     t1=mach_absolute_time(); t_bwd_ane+=tb_ms(t1-t0); t0=t1;
-                    io_read_fp16(kern[L].rmsBwd->ioOut, dx2, 0, DIM, SEQ);
-                    t1=mach_absolute_time(); t_bwd_io+=tb_ms(t1-t0);
-                    // Add residual: dx2 += dy (from skip connection)
-                    t0=mach_absolute_time();
-                    for(int i=0;i<SEQ*DIM;i++) dx2[i] += dy[i];
-                    t1=mach_absolute_time(); t_resid+=tb_ms(t1-t0);
 
-                    // dWo async (attn_out[slot] populated in forward)
-                    t0=mach_absolute_time();
-                    memcpy(cap->dx2[slot], dx2, SEQ*DIM*4);
-                    t1=mach_absolute_time(); t_memcpy+=tb_ms(t1-t0);
+                    // dWo async — dx2 captured as fp16 from fused rmsBwd2 output
+                    { const _Float16 *rms_out = io_lock_ro(kern[L].rmsBwd2->ioOut);
+                    memcpy(cap->dx2_f16[slot], rms_out, DIM * SEQ * sizeof(_Float16));
+                    io_unlock_ro(kern[L].rmsBwd2->ioOut);
+                    }
+                    t1=mach_absolute_time(); t_bwd_io+=tb_ms(t1-t0);
                     dispatch_group_async(layer_dw_grp, dw_layer_q[L], ^{
                         uint64_t dw0=mach_absolute_time();
+                        cvt_f16_f32(cap->dx2[slot],  cap->dx2_f16[slot], DIM * SEQ);
                         cvt_f16_f32(cap->attn_out[slot], cap->attn_f16[slot], DIM * SEQ);
                         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, DIM, DIM, SEQ,
                                     1.0f, cap->dx2[slot], SEQ, cap->attn_out[slot], SEQ, 1.0f, gr->Wo, DIM);
                         dw_t_wo[L]+=tb_ms(mach_absolute_time()-dw0);
                     });
 
-                    // SDPA backward (ANE)
-                    // sdpaBwd1 needs RoPE'd Q,K (from attnFwd->ioIn), V (from qkvFwd->ioOut), dx2
+                    // SDPA backward (ANE) — dx2 from fused rmsBwd2 output (fp16 direct)
                     t0=mach_absolute_time();
-                    { // Batch: sdpaBwd1->ioIn + attnFwd->ioIn (RoPE'd Q,K) + qkvFwd->ioOut (V)
+                    { // Batch: sdpaBwd1->ioIn + attnFwd->ioIn (Q,K) + qkvFwd->ioOut (V) + rmsBwd2->ioOut (dx2)
                     _Float16 *bwd1_in = io_lock_rw(kern[L].sdpaBwd1->ioIn);
                     const _Float16 *attn_in = io_lock_ro(kern[L].attnFwd->ioIn);
                     const _Float16 *qkv_out = io_lock_ro(kern[L].qkvFwd->ioOut);
-                    memcpy(bwd1_in,            attn_in,                 2*DIM * SEQ * sizeof(_Float16)); // Q_rope, K_rope
-                    memcpy(bwd1_in + 2*DIM*SEQ, qkv_out + 2*DIM*SEQ,  DIM * SEQ * sizeof(_Float16));   // V
+                    const _Float16 *rms_out = io_lock_ro(kern[L].rmsBwd2->ioOut);
+                    memcpy(bwd1_in,            attn_in,                 2*DIM * SEQ * sizeof(_Float16));
+                    memcpy(bwd1_in + 2*DIM*SEQ, qkv_out + 2*DIM*SEQ,  DIM * SEQ * sizeof(_Float16));
+                    memcpy(bwd1_in + 3*DIM*SEQ, rms_out,               DIM * SEQ * sizeof(_Float16));
+                    io_unlock_ro(kern[L].rmsBwd2->ioOut);
                     io_unlock_ro(kern[L].qkvFwd->ioOut);
                     io_unlock_ro(kern[L].attnFwd->ioIn);
-                    cvt_f32_f16(bwd1_in + 3*DIM*SEQ, dx2, DIM * SEQ);
                     io_unlock_rw(kern[L].sdpaBwd1->ioIn);
                     }
                     t1=mach_absolute_time(); t_bwd_io+=tb_ms(t1-t0); t0=t1;
@@ -892,34 +911,35 @@ int main(int argc, char *argv[]) {
                     io_read_fp16(kern[L].qkvBwd->ioOut, dx_attn, 0, DIM, SEQ);
                     t1=mach_absolute_time(); t_bwd_io+=tb_ms(t1-t0);
 
-                    // RMSNorm1 backward: dw on CPU (while fp32 dy is in dx_attn), dx on ANE
+                    // RMSNorm1 backward: dw on CPU, dx+resid fused on ANE (rmsBwd1)
                     t0=mach_absolute_time();
                     rmsnorm_dw(gr->rms_att, dx_attn, ac->layer_in, ac->rrms_att, DIM, SEQ);
                     t1=mach_absolute_time(); t_rms_bwd+=tb_ms(t1-t0); t0=t1;
-                    { // Batch: rmsBwd->ioIn (3 writes→1) + qkvBwd->ioOut + qkvFwd->ioIn
-                    _Float16 *rms_in = io_lock_rw(kern[L].rmsBwd->ioIn);
+                    { // Pack rmsBwd1: dx_attn, x, w, dx2 (from rmsBwd2 fused output)
+                    _Float16 *rms_in = io_lock_rw(kern[L].rmsBwd1->ioIn);
                     const _Float16 *qkv_p = io_lock_ro(kern[L].qkvBwd->ioOut);
                     const _Float16 *qkv_fwd_in = io_lock_ro(kern[L].qkvFwd->ioIn);
+                    const _Float16 *rms2_out = io_lock_ro(kern[L].rmsBwd2->ioOut);
                     memcpy(rms_in, qkv_p, DIM * SEQ * sizeof(_Float16));
                     memcpy(rms_in + DIM*SEQ, qkv_fwd_in, DIM * SEQ * sizeof(_Float16));
-                    io_unlock_ro(kern[L].qkvFwd->ioIn);
-                    io_unlock_ro(kern[L].qkvBwd->ioOut);
                     for (int c = 0; c < DIM; c++)
                         rms_in[(2*DIM + c) * SEQ] = (_Float16)lw[L].rms_att[c];
-                    io_unlock_rw(kern[L].rmsBwd->ioIn);
+                    memcpy(rms_in + 3*DIM*SEQ, rms2_out, DIM * SEQ * sizeof(_Float16));
+                    io_unlock_ro(kern[L].rmsBwd2->ioOut);
+                    io_unlock_ro(kern[L].qkvFwd->ioIn);
+                    io_unlock_ro(kern[L].qkvBwd->ioOut);
+                    io_unlock_rw(kern[L].rmsBwd1->ioIn);
                     }
                     t1=mach_absolute_time(); t_bwd_io+=tb_ms(t1-t0); t0=t1;
-                    ane_eval(kern[L].rmsBwd);
-                    t1=mach_absolute_time(); t_bwd_ane+=tb_ms(t1-t0); t0=t1;
-                    io_read_fp16(kern[L].rmsBwd->ioOut, dx_attn, 0, DIM, SEQ);
-                    t1=mach_absolute_time(); t_bwd_io+=tb_ms(t1-t0);
-
-                    // dy for previous layer = dx_attn (through rmsnorm1) + dx2 (skip connection)
-                    t0=mach_absolute_time();
-                    for(int i=0;i<SEQ*DIM;i++) dy[i] = dx_attn[i] + dx2[i];
-                    t1=mach_absolute_time(); t_resid+=tb_ms(t1-t0);
+                    ane_eval(kern[L].rmsBwd1);
+                    t1=mach_absolute_time(); t_bwd_ane+=tb_ms(t1-t0);
+                    // Fused output = dx_rms + dx2 → stays on rmsBwd1->ioOut for next layer
                 }
 
+                // Read final dy from rmsBwd1[0] fused output (fp16→fp32 for embed backward)
+                t0=mach_absolute_time();
+                io_read_fp16(kern[0].rmsBwd1->ioOut, dy, 0, DIM, SEQ);
+                t1=mach_absolute_time(); t_bwd_io+=tb_ms(t1-t0);
                 // Embedding backward — scatter-add into separate accumulator (no wait needed)
                 t0=mach_absolute_time();
                 embed_backward(gembed_emb, dy, input_tokens, DIM, SEQ);
@@ -1081,7 +1101,7 @@ int main(int argc, char *argv[]) {
         for (int L=0; L<NLAYERS; L++) {
             free_layer_kernels(&kern[L]);
             free_kern(sdpaBwd2[L]);
-            free_kern(kern[L].rmsBwd);
+            free_kern(kern[L].rmsBwd2); free_kern(kern[L].rmsBwd1);
             layer_weights_free(&lw[L]);
             layer_adam_free(&la[L]);
             layer_acts_free(&acts[L]);
