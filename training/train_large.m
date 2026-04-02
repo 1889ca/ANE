@@ -551,7 +551,7 @@ int main(int argc, char *argv[]) {
                     const _Float16 *qkv_p = io_lock_ro(kern[L].qkvFwd->ioOut);
                     neon_rope_fwd_f16(qkv_p, attn_in, 0, DIM*SEQ, 0, DIM*SEQ);
                     memcpy(attn_in + 2*DIM*SEQ, qkv_p + 2*DIM*SEQ, DIM * SEQ * sizeof(_Float16));
-                    cvt_f16_f32(dwcap[L].xnorm[slot],    qkv_p + 3*DIM*SEQ, DIM * SEQ);
+                    memcpy(dwcap[L].xnorm_f16[slot],     qkv_p + 3*DIM*SEQ, DIM * SEQ * sizeof(_Float16));
                     cvt_f16_f32(ac->rrms_att,            qkv_p + 4*DIM*SEQ, 1 * SEQ);
                     io_unlock_ro(kern[L].qkvFwd->ioOut);
                     cvt_f32_f16(attn_in + 3*DIM*SEQ,   x_cur,   DIM * SEQ);
@@ -563,7 +563,7 @@ int main(int argc, char *argv[]) {
                     { const _Float16 *qkv_p = io_lock_ro(kern[L].qkvFwd->ioOut);
                     cvt_f16_f32(rope_q,                  qkv_p,              DIM * SEQ);
                     cvt_f16_f32(rope_k,                  qkv_p + DIM*SEQ,    DIM * SEQ);
-                    cvt_f16_f32(dwcap[L].xnorm[slot],    qkv_p + 3*DIM*SEQ, DIM * SEQ);
+                    memcpy(dwcap[L].xnorm_f16[slot],     qkv_p + 3*DIM*SEQ, DIM * SEQ * sizeof(_Float16));
                     cvt_f16_f32(ac->rrms_att,            qkv_p + 4*DIM*SEQ, 1 * SEQ);
                     io_unlock_ro(kern[L].qkvFwd->ioOut);
                     }
@@ -589,7 +589,7 @@ int main(int argc, char *argv[]) {
                     memcpy(ffn_in_p, attn_out_p, DIM * SEQ * sizeof(_Float16));
                     io_unlock_rw(kern[L].fwdFFN->ioIn);
                     cvt_f16_f32(ac->x2,                  attn_out_p,              DIM * SEQ);
-                    cvt_f16_f32(dwcap[L].attn_out[slot], attn_out_p + DIM*SEQ,    DIM * SEQ);
+                    memcpy(dwcap[L].attn_f16[slot],      attn_out_p + DIM*SEQ,    DIM * SEQ * sizeof(_Float16));
                     io_unlock_ro(kern[L].attnFwd->ioOut);
                     }
                     t1=mach_absolute_time(); t_io+=tb_ms(t1-t0); t0=t1;
@@ -597,13 +597,11 @@ int main(int argc, char *argv[]) {
                     // FFN forward (x2 already piped via memcpy above)
                     ane_eval(kern[L].fwdFFN);
                     t1=mach_absolute_time(); t_ane+=tb_ms(t1-t0); t0=t1;
-                    { // Batch: fwdFFN->ioOut (6 locks→1)
+                    { // Batch: fwdFFN->ioOut — defer dW captures as fp16 memcpy
                     const _Float16 *ffn_p = io_lock_ro(kern[L].fwdFFN->ioOut);
                     cvt_f16_f32(x_cur,                   ffn_p,                        DIM * SEQ);
-                    cvt_f16_f32(ac->h1,                  ffn_p + DIM*SEQ,               HIDDEN * SEQ);
-                    cvt_f16_f32(ac->h3,                  ffn_p + (DIM+HIDDEN)*SEQ,      HIDDEN * SEQ);
-                    cvt_f16_f32(dwcap[L].silu_out[slot], ffn_p + (DIM+2*HIDDEN)*SEQ,    HIDDEN * SEQ);
-                    cvt_f16_f32(dwcap[L].x2norm[slot],   ffn_p + (DIM+3*HIDDEN)*SEQ,    DIM * SEQ);
+                    memcpy(dwcap[L].silu_f16[slot],      ffn_p + (DIM+2*HIDDEN)*SEQ,   HIDDEN * SEQ * sizeof(_Float16));
+                    memcpy(dwcap[L].x2norm_f16[slot],    ffn_p + (DIM+3*HIDDEN)*SEQ,   DIM * SEQ * sizeof(_Float16));
                     cvt_f16_f32(ac->rrms_ffn,            ffn_p + (2*DIM+3*HIDDEN)*SEQ,  1 * SEQ);
                     io_unlock_ro(kern[L].fwdFFN->ioOut);
                     }
@@ -736,18 +734,22 @@ int main(int argc, char *argv[]) {
                     t1=mach_absolute_time(); t_bwd_io+=tb_ms(t1-t0); t0=t1;
                     ane_eval(kern[L].ffnBwd);
                     t1=mach_absolute_time(); t_bwd_ane+=tb_ms(t1-t0); t0=t1;
-                    { // Batch: ffnBwd->ioOut (3 reads→1)
+                    { // Batch: ffnBwd->ioOut — defer dh1/dh3 as fp16 memcpy
                     const _Float16 *bwd_out = io_lock_ro(kern[L].ffnBwd->ioOut);
                     cvt_f16_f32(dx_ffn,         bwd_out,                      DIM * SEQ);
-                    cvt_f16_f32(cap->dh1[slot], bwd_out + DIM*SEQ,            HIDDEN * SEQ);
-                    cvt_f16_f32(cap->dh3[slot], bwd_out + (DIM+HIDDEN)*SEQ,   HIDDEN * SEQ);
+                    memcpy(cap->dh1_f16[slot],  bwd_out + DIM*SEQ,            HIDDEN * SEQ * sizeof(_Float16));
+                    memcpy(cap->dh3_f16[slot],  bwd_out + (DIM+HIDDEN)*SEQ,   HIDDEN * SEQ * sizeof(_Float16));
                     io_unlock_ro(kern[L].ffnBwd->ioOut);
                     }
                     t1=mach_absolute_time(); t_bwd_io+=tb_ms(t1-t0);
 
-                    // dW FFN async (silu_out[slot], x2norm[slot] populated in forward)
+                    // dW FFN async — deferred fp16→fp32 conversion + sgemm
                     dispatch_group_async(layer_dw_grp, dw_layer_q[L], ^{
                         uint64_t dw0=mach_absolute_time();
+                        cvt_f16_f32(cap->silu_out[slot], cap->silu_f16[slot], HIDDEN * SEQ);
+                        cvt_f16_f32(cap->x2norm[slot],   cap->x2norm_f16[slot], DIM * SEQ);
+                        cvt_f16_f32(cap->dh1[slot],      cap->dh1_f16[slot], HIDDEN * SEQ);
+                        cvt_f16_f32(cap->dh3[slot],      cap->dh3_f16[slot], HIDDEN * SEQ);
                         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, DIM, HIDDEN, SEQ,
                                     1.0f, cap->dffn[slot], SEQ, cap->silu_out[slot], SEQ, 1.0f, gr->W2, HIDDEN);
                         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, HIDDEN, DIM, SEQ,
@@ -789,6 +791,7 @@ int main(int argc, char *argv[]) {
                     t1=mach_absolute_time(); t_memcpy+=tb_ms(t1-t0);
                     dispatch_group_async(layer_dw_grp, dw_layer_q[L], ^{
                         uint64_t dw0=mach_absolute_time();
+                        cvt_f16_f32(cap->attn_out[slot], cap->attn_f16[slot], DIM * SEQ);
                         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, DIM, DIM, SEQ,
                                     1.0f, cap->dx2[slot], SEQ, cap->attn_out[slot], SEQ, 1.0f, gr->Wo, DIM);
                         dw_t_wo[L]+=tb_ms(mach_absolute_time()-dw0);
@@ -827,17 +830,18 @@ int main(int argc, char *argv[]) {
 
                     if (neon_rope) {
                     // NEON fp16 path: single-pass inverse RoPE → fp16 (qkvBwd) + fp32 (dW sgemm)
+                    // dV folded into same lock (eliminates extra lock/unlock pair)
                     { _Float16 *qkv_in = io_lock_rw(kern[L].qkvBwd->ioIn);
                     const _Float16 *bwd2_p = io_lock_ro(sdpaBwd2[L]->ioOut);
                     const _Float16 *bwd1_p = io_lock_ro(kern[L].sdpaBwd1->ioOut);
                     neon_rope_bwd_f16(bwd2_p, qkv_in, cap->dq[slot], cap->dk[slot],
                                        0, DIM*SEQ, 0, DIM*SEQ);
                     memcpy(qkv_in + 2*DIM*SEQ, bwd1_p, DIM * SEQ * sizeof(_Float16));
+                    memcpy(cap->dv_f16[slot],  bwd1_p, DIM * SEQ * sizeof(_Float16));
                     io_unlock_ro(kern[L].sdpaBwd1->ioOut);
                     io_unlock_ro(sdpaBwd2[L]->ioOut);
                     io_unlock_rw(kern[L].qkvBwd->ioIn);
                     }
-                    io_read_fp16(kern[L].sdpaBwd1->ioOut, cap->dv[slot], 0, DIM, SEQ);
                     t1=mach_absolute_time(); t_bwd_io+=tb_ms(t1-t0);
                     } else {
                     // CPU fallback: read dQ,dK → rotate → write back
@@ -853,9 +857,12 @@ int main(int argc, char *argv[]) {
                     t1=mach_absolute_time(); t_bwd_io+=tb_ms(t1-t0);
                     }
 
-                    // dWq/dWk/dWv async (xnorm[slot] populated in forward, dq/dk are pre-RoPE)
+                    // dWq/dWk/dWv async — deferred fp16→fp32 conversion + sgemm
                     dispatch_group_async(layer_dw_grp, dw_layer_q[L], ^{
                         uint64_t dw0=mach_absolute_time();
+                        cvt_f16_f32(cap->xnorm[slot], cap->xnorm_f16[slot], DIM * SEQ);
+                        if (neon_rope)
+                            cvt_f16_f32(cap->dv[slot], cap->dv_f16[slot], DIM * SEQ);
                         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, DIM, DIM, SEQ,
                                     1.0f, cap->dq[slot], SEQ, cap->xnorm[slot], SEQ, 1.0f, gr->Wq, DIM);
                         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, DIM, DIM, SEQ,

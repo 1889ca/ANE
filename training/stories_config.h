@@ -74,27 +74,34 @@ typedef struct {
     float *layer_in;    // [DIM, SEQ] input to this layer (for rmsnorm1 bwd)
     float *Q, *K, *V;  // [DIM, SEQ] QKV projections
     float *x2;          // [DIM, SEQ] residual after attn (fused on ANE)
-    float *h1, *h3;     // [HIDDEN, SEQ] FFN intermediates
     float *rrms_att;    // [SEQ] cached rrms from rmsnorm1 (for dw)
     float *rrms_ffn;    // [SEQ] cached rrms from rmsnorm2 (for dw)
 } LayerActs;
 
 // Double-buffered dW capture slots (eliminates malloc+memcpy per step)
+// fp16 buffers capture data from IOSurfaces; conversion deferred to async dW path
 typedef struct {
-    // Activations: io_read writes here directly in forward
-    float *silu_out[2];  // [HIDDEN, SEQ]
-    float *x2norm[2];    // [DIM, SEQ]
-    float *attn_out[2];  // [DIM, SEQ]
-    float *xnorm[2];     // [DIM, SEQ]
-    // Gradients: io_read writes here directly in backward
-    float *dh1[2];       // [HIDDEN, SEQ]
-    float *dh3[2];       // [HIDDEN, SEQ]
-    float *dq[2];        // [DIM, SEQ]
-    float *dk[2];        // [DIM, SEQ]
-    float *dv[2];        // [DIM, SEQ]
-    // Gradients: memcpy from main-thread buffers
-    float *dffn[2];      // [DIM, SEQ]
-    float *dx2[2];       // [DIM, SEQ]
+    // Activations: fp16 memcpy from IOSurface in forward, cvt in async dW
+    _Float16 *silu_f16[2];  // [HIDDEN, SEQ]
+    _Float16 *x2norm_f16[2];// [DIM, SEQ]
+    _Float16 *attn_f16[2];  // [DIM, SEQ]
+    _Float16 *xnorm_f16[2]; // [DIM, SEQ]
+    float *silu_out[2];     // [HIDDEN, SEQ] — fp32 conversion target
+    float *x2norm[2];       // [DIM, SEQ]
+    float *attn_out[2];     // [DIM, SEQ]
+    float *xnorm[2];        // [DIM, SEQ]
+    // Gradients: fp16 memcpy from IOSurface in backward, cvt in async dW
+    _Float16 *dh1_f16[2];   // [HIDDEN, SEQ]
+    _Float16 *dh3_f16[2];   // [HIDDEN, SEQ]
+    _Float16 *dv_f16[2];    // [DIM, SEQ]
+    float *dh1[2];          // [HIDDEN, SEQ] — fp32 conversion target
+    float *dh3[2];          // [HIDDEN, SEQ]
+    float *dq[2];           // [DIM, SEQ] — written directly by neon_rope_bwd
+    float *dk[2];           // [DIM, SEQ]
+    float *dv[2];           // [DIM, SEQ]
+    // Gradients: memcpy from main-thread buffers (already fp32)
+    float *dffn[2];         // [DIM, SEQ]
+    float *dx2[2];          // [DIM, SEQ]
     dispatch_semaphore_t sem;
 } LayerDWCap;
 
@@ -178,19 +185,26 @@ static LayerActs layer_acts_alloc(void) {
     a.Q=(float*)malloc(SEQ*DIM*4);
     a.K=(float*)malloc(SEQ*DIM*4); a.V=(float*)malloc(SEQ*DIM*4);
     a.x2=(float*)malloc(SEQ*DIM*4);
-    a.h1=(float*)malloc(SEQ*HIDDEN*4); a.h3=(float*)malloc(SEQ*HIDDEN*4);
     a.rrms_att=(float*)malloc(SEQ*4); a.rrms_ffn=(float*)malloc(SEQ*4);
     return a;
 }
 static void layer_acts_free(LayerActs *a) {
     free(a->layer_in);free(a->Q);free(a->K);free(a->V);
     free(a->x2);
-    free(a->h1);free(a->h3);
     free(a->rrms_att);free(a->rrms_ffn);
 }
 static LayerDWCap layer_dwcap_alloc(void) {
     LayerDWCap c;
     for (int s=0; s<2; s++) {
+        // fp16 capture buffers (memcpy from IOSurface on critical path)
+        c.silu_f16[s]=(_Float16*)malloc(SEQ*HIDDEN*2);
+        c.x2norm_f16[s]=(_Float16*)malloc(SEQ*DIM*2);
+        c.attn_f16[s]=(_Float16*)malloc(SEQ*DIM*2);
+        c.xnorm_f16[s]=(_Float16*)malloc(SEQ*DIM*2);
+        c.dh1_f16[s]=(_Float16*)malloc(SEQ*HIDDEN*2);
+        c.dh3_f16[s]=(_Float16*)malloc(SEQ*HIDDEN*2);
+        c.dv_f16[s]=(_Float16*)malloc(SEQ*DIM*2);
+        // fp32 conversion targets (written in async dW path)
         c.silu_out[s]=(float*)malloc(SEQ*HIDDEN*4);
         c.x2norm[s]=(float*)malloc(SEQ*DIM*4);
         c.attn_out[s]=(float*)malloc(SEQ*DIM*4);
@@ -208,6 +222,9 @@ static LayerDWCap layer_dwcap_alloc(void) {
 }
 static void layer_dwcap_free(LayerDWCap *c) {
     for (int s=0; s<2; s++) {
+        free(c->silu_f16[s]);free(c->x2norm_f16[s]);
+        free(c->attn_f16[s]);free(c->xnorm_f16[s]);
+        free(c->dh1_f16[s]);free(c->dh3_f16[s]);free(c->dv_f16[s]);
         free(c->silu_out[s]);free(c->x2norm[s]);
         free(c->attn_out[s]);free(c->xnorm[s]);
         free(c->dh1[s]);free(c->dh3[s]);
