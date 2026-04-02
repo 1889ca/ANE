@@ -267,9 +267,11 @@ int main(int argc, char *argv[]) {
         float *grms_final = (float*)calloc(DIM, 4);
         float *gembed_cls = (float*)calloc(VOCAB*DIM, 4);  // dense sgemm accumulator
         float *gembed_emb = (float*)calloc(VOCAB*DIM, 4);  // scatter-add accumulator
-        // Double-buffered dlogits/x_final capture (eliminates 32MB malloc/free per step)
+        // Double-buffered dlogits/x_final capture
+        _Float16 *capt_dlogits_f16[2];  // fp16 capture from softmax IOSurface
         float *capt_dlogits[2], *capt_xfinal[2];
         for (int s=0; s<2; s++) {
+            capt_dlogits_f16[s] = (_Float16*)malloc((size_t)SEQ*VOCAB*2);
             capt_dlogits[s] = (float*)malloc((size_t)SEQ*VOCAB*4);
             capt_xfinal[s] = (float*)malloc(SEQ*DIM*4);
         }
@@ -639,34 +641,43 @@ int main(int argc, char *argv[]) {
                 if (use_ane_softmax && use_ane_cls) {
                     io_copy(softmax_kern->ioIn, 0, cls_fwd->ioOut, 0, VOCAB, SEQ);
                     ane_eval(softmax_kern);
-                    io_read_fp16(softmax_kern->ioOut, dlogits, 0, VOCAB, SEQ);
-                    // Loss: read target probabilities (256 lookups)
+                    // Compute loss + gradient in fp16 directly on softmax output
+                    // Combined scale: (1/SEQ) * LOSS_SCALE = 1.0, so dlogits = probs with target -= 1
+                    _Float16 *probs = io_lock_rw(softmax_kern->ioOut);
                     float total_loss = 0;
-                    for (int t = 0; t < SEQ; t++)
-                        total_loss -= logf(dlogits[target_tokens[t]*SEQ + t] + 1e-10f);
+                    for (int t = 0; t < SEQ; t++) {
+                        size_t idx = (size_t)target_tokens[t]*SEQ + t;
+                        total_loss -= logf((float)probs[idx] + 1e-10f);
+                        probs[idx] -= (_Float16)1.0f;
+                    }
                     loss = total_loss / SEQ;
-                    // Gradient: dlogits = probs/S, correct at target positions
-                    float invS = 1.0f / SEQ;
-                    vDSP_vsmul(dlogits, 1, &invS, dlogits, 1, (vDSP_Length)(VOCAB*SEQ));
-                    for (int t = 0; t < SEQ; t++)
-                        dlogits[target_tokens[t]*SEQ + t] -= invS;
+                    // Copy fp16 dlogits to cls_bwd input + embed dW capture
+                    _Float16 *cls_in = io_lock_rw(cls_bwd->ioIn);
+                    memcpy(cls_in, probs, (size_t)VOCAB * SEQ * sizeof(_Float16));
+                    io_unlock_rw(cls_bwd->ioIn);
+                    memcpy(capt_dlogits_f16[slot], probs, (size_t)VOCAB * SEQ * sizeof(_Float16));
+                    io_unlock_rw(softmax_kern->ioOut);
                 } else {
                     if (use_ane_cls)
                         io_read_fp16(cls_fwd->ioOut, logits, 0, VOCAB, SEQ);
                     loss = cross_entropy_loss(dlogits, logits, target_tokens, VOCAB, SEQ);
+                    float ls = LOSS_SCALE;
+                    vDSP_vsmul(dlogits, 1, &ls, dlogits, 1, (vDSP_Length)((size_t)VOCAB*SEQ));
+                    // Fallback: copy fp32 dlogits to fp16 capture
+                    cvt_f32_f16(capt_dlogits_f16[slot], dlogits, (int)((size_t)VOCAB*SEQ));
                 }
                 last_loss = loss;
-                // Loss scaling: amplify gradients before they enter fp16 ANE backward
-                float ls = LOSS_SCALE;
-                vDSP_vsmul(dlogits, 1, &ls, dlogits, 1, (vDSP_Length)((size_t)VOCAB*SEQ));
                 t1=mach_absolute_time(); t_xent+=tb_ms(t1-t0); t0=t1;
 
                 // ===== BACKWARD =====
                 // Classifier backward: dx_final = embed^T @ dlogits
                 t0=mach_absolute_time();
                 if (cls_bwd) {
-                    // ANE cls_bwd (mode 0: original, mode 1: tiled)
-                    io_write_fp16(cls_bwd->ioIn, dlogits, VOCAB, SEQ);
+                    if (!(use_ane_softmax && use_ane_cls)) {
+                        // Non-ANE softmax path: write fp32 dlogits to cls_bwd
+                        io_write_fp16(cls_bwd->ioIn, dlogits, VOCAB, SEQ);
+                    }
+                    // ANE softmax path: cls_bwd->ioIn already populated above
                     t1=mach_absolute_time(); t_bwd_io+=tb_ms(t1-t0); t0=t1;
                     ane_eval(cls_bwd);
                     t1=mach_absolute_time(); t_cls_bwd+=tb_ms(t1-t0); t0=t1;
@@ -681,12 +692,14 @@ int main(int argc, char *argv[]) {
                 }
 
                 // dembed_cls[VOCAB,DIM] += dlogits[VOCAB,SEQ] @ x_final^T[SEQ,DIM]
-                // Double-buffered capture (no malloc), tiled sgemm via dispatch_apply
-                float *cd = capt_dlogits[slot], *cx = capt_xfinal[slot];
-                memcpy(cd, dlogits, (size_t)SEQ*VOCAB*4);
+                // fp16 dlogits captured above, converted in async path
+                float *cx = capt_xfinal[slot];
                 memcpy(cx, x_final, SEQ*DIM*4);
+                float *cd = capt_dlogits[slot];
+                _Float16 *cd16 = capt_dlogits_f16[slot];
                 dispatch_group_async(embed_dw_grp, dw_embed_q, ^{
                     uint64_t dw0=mach_absolute_time();
+                    cvt_f16_f32(cd, cd16, (int)((size_t)VOCAB * SEQ));
                     int ntiles = 8, chunk = VOCAB / ntiles;
                     dispatch_apply(ntiles, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t i) {
                         int start = (int)i * chunk;
@@ -1112,7 +1125,7 @@ int main(int argc, char *argv[]) {
         close(data_fd);
         free(rms_final); free(rrms_final); free(embed); free(grms_final);
         free(gembed_cls); free(gembed_emb);
-        for (int s=0; s<2; s++) { free(capt_dlogits[s]); free(capt_xfinal[s]); }
+        for (int s=0; s<2; s++) { free(capt_dlogits_f16[s]); free(capt_dlogits[s]); free(capt_xfinal[s]); }
         adam_free(&arms_final); adam_free(&aembed);
         free(dy); free(dx_ffn); free(dx2); free(dx_attn);
         free(x_cur); free(x_final); free(logits); free(dlogits);
