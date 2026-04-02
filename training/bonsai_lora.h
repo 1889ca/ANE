@@ -36,7 +36,7 @@ static void q1_dequantize(float *out, const Q1Block *blocks, int n_weights) {
             int byte_idx = i / 8;
             int bit_idx = i % 8;
             int sign = (blocks[b].signs[byte_idx] >> bit_idx) & 1;
-            out[b * BONSAI_Q1_GROUP + i] = sign ? -scale : scale;
+            out[b * BONSAI_Q1_GROUP + i] = sign ? scale : -scale;
         }
     }
 }
@@ -51,7 +51,7 @@ static _Float16 *q1_dequantize_fp16(const Q1Block *blocks, int n_weights) {
             int byte_idx = i / 8;
             int bit_idx = i % 8;
             int sign = (blocks[b].signs[byte_idx] >> bit_idx) & 1;
-            out[b * BONSAI_Q1_GROUP + i] = sign ? -scale : scale;
+            out[b * BONSAI_Q1_GROUP + i] = sign ? scale : -scale;
         }
     }
     return out;
@@ -138,6 +138,202 @@ static NSData *bonsai_build_lora_blob(const float *W, int out_ch, int in_ch,
     return [NSData dataWithBytesNoCopy:buf length:total freeWhenDone:YES];
 }
 
+// ===== GGUF file loader =====
+
+#define GGUF_MAGIC 0x46554747
+#define GGUF_VERSION 3
+#define GGUF_ALIGN 32
+
+// GGUF value types
+enum { GGUF_U8=0, GGUF_I8=1, GGUF_U16=2, GGUF_I16=3, GGUF_U32=4, GGUF_I32=5,
+       GGUF_F32=6, GGUF_BOOL=7, GGUF_STRING=8, GGUF_ARRAY=9, GGUF_U64=10,
+       GGUF_I64=11, GGUF_F64=12 };
+
+// GGUF quantization types
+enum { GGUF_TYPE_F32=0, GGUF_TYPE_F16=1, GGUF_TYPE_Q1_0=40, GGUF_TYPE_Q1_0_G128=41 };
+
+// Parsed tensor info
+typedef struct {
+    char name[128];
+    uint32_t n_dims;
+    uint64_t dims[4];
+    uint32_t dtype;
+    uint64_t offset;    // relative to data section start
+    uint64_t n_elements;
+    uint64_t data_size;
+} GGUFTensor;
+
+// GGUF file handle
+typedef struct {
+    uint8_t *data;          // mmap'd file
+    size_t file_size;
+    int fd;
+    uint64_t n_tensors;
+    uint64_t n_kv;
+    GGUFTensor *tensors;    // parsed tensor array
+    uint64_t data_start;    // offset where tensor data begins
+} GGUFFile;
+
+// Read a GGUF string: [uint64 len][bytes] → advance pos
+static char *gguf_read_string(const uint8_t *data, size_t *pos, size_t file_size) {
+    if (*pos + 8 > file_size) return NULL;
+    uint64_t len = *(uint64_t *)(data + *pos); *pos += 8;
+    if (*pos + len > file_size || len > 4096) return NULL;
+    char *s = (char *)malloc(len + 1);
+    memcpy(s, data + *pos, len);
+    s[len] = '\0';
+    *pos += len;
+    return s;
+}
+
+// Skip a GGUF value (for metadata we don't need)
+static void gguf_skip_value(const uint8_t *data, size_t *pos, uint32_t type, size_t file_size) {
+    switch (type) {
+        case GGUF_U8: case GGUF_I8: case GGUF_BOOL: *pos += 1; break;
+        case GGUF_U16: case GGUF_I16: *pos += 2; break;
+        case GGUF_U32: case GGUF_I32: case GGUF_F32: *pos += 4; break;
+        case GGUF_U64: case GGUF_I64: case GGUF_F64: *pos += 8; break;
+        case GGUF_STRING: { free(gguf_read_string(data, pos, file_size)); break; }
+        case GGUF_ARRAY: {
+            uint32_t elem_type = *(uint32_t *)(data + *pos); *pos += 4;
+            uint64_t count = *(uint64_t *)(data + *pos); *pos += 8;
+            for (uint64_t i = 0; i < count; i++)
+                gguf_skip_value(data, pos, elem_type, file_size);
+            break;
+        }
+    }
+}
+
+// Calculate data size for a tensor
+static uint64_t gguf_tensor_data_size(uint32_t dtype, uint64_t n_elements) {
+    switch (dtype) {
+        case GGUF_TYPE_F32: return n_elements * 4;
+        case GGUF_TYPE_F16: return n_elements * 2;
+        case GGUF_TYPE_Q1_0: return (n_elements / 32) * 6;       // 6 bytes per 32-element block
+        case GGUF_TYPE_Q1_0_G128: return (n_elements / 128) * 18; // 18 bytes per 128-element block
+        default: fprintf(stderr, "Unknown GGUF dtype %d\n", dtype); return 0;
+    }
+}
+
+// Open and parse a GGUF file
+static GGUFFile *gguf_open(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "Cannot open %s\n", path); return NULL; }
+    struct stat st; fstat(fd, &st);
+    size_t file_size = st.st_size;
+    uint8_t *data = (uint8_t *)mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (data == MAP_FAILED) { close(fd); return NULL; }
+
+    // Verify header
+    if (file_size < 24) { munmap(data, file_size); close(fd); return NULL; }
+    uint32_t magic = *(uint32_t *)(data);
+    uint32_t version = *(uint32_t *)(data + 4);
+    if (magic != GGUF_MAGIC) {
+        fprintf(stderr, "Bad GGUF magic: 0x%08X (expected 0x%08X)\n", magic, GGUF_MAGIC);
+        munmap(data, file_size); close(fd); return NULL;
+    }
+    if (version != GGUF_VERSION) {
+        fprintf(stderr, "GGUF version %d (expected %d)\n", version, GGUF_VERSION);
+        munmap(data, file_size); close(fd); return NULL;
+    }
+
+    GGUFFile *gf = (GGUFFile *)calloc(1, sizeof(GGUFFile));
+    gf->data = data;
+    gf->file_size = file_size;
+    gf->fd = fd;
+    gf->n_tensors = *(uint64_t *)(data + 8);
+    gf->n_kv = *(uint64_t *)(data + 16);
+
+    // Skip KV pairs
+    size_t pos = 24;
+    for (uint64_t i = 0; i < gf->n_kv; i++) {
+        char *key = gguf_read_string(data, &pos, file_size);
+        if (!key) { fprintf(stderr, "GGUF: bad KV at %zu\n", pos); break; }
+        uint32_t vtype = *(uint32_t *)(data + pos); pos += 4;
+        free(key);
+        gguf_skip_value(data, &pos, vtype, file_size);
+    }
+
+    // Parse tensor info entries
+    gf->tensors = (GGUFTensor *)calloc(gf->n_tensors, sizeof(GGUFTensor));
+    for (uint64_t t = 0; t < gf->n_tensors; t++) {
+        GGUFTensor *ti = &gf->tensors[t];
+        char *name = gguf_read_string(data, &pos, file_size);
+        if (name) { strncpy(ti->name, name, 127); free(name); }
+        ti->n_dims = *(uint32_t *)(data + pos); pos += 4;
+        ti->n_elements = 1;
+        for (uint32_t d = 0; d < ti->n_dims; d++) {
+            ti->dims[d] = *(uint64_t *)(data + pos); pos += 8;
+            ti->n_elements *= ti->dims[d];
+        }
+        ti->dtype = *(uint32_t *)(data + pos); pos += 4;
+        ti->offset = *(uint64_t *)(data + pos); pos += 8;
+        ti->data_size = gguf_tensor_data_size(ti->dtype, ti->n_elements);
+    }
+
+    // Data section starts at aligned position
+    gf->data_start = (pos + GGUF_ALIGN - 1) / GGUF_ALIGN * GGUF_ALIGN;
+
+    printf("GGUF: %s — %llu tensors, data at offset %llu\n",
+           path, gf->n_tensors, gf->data_start);
+    return gf;
+}
+
+// Find a tensor by name
+static GGUFTensor *gguf_find(GGUFFile *gf, const char *name) {
+    for (uint64_t i = 0; i < gf->n_tensors; i++)
+        if (strcmp(gf->tensors[i].name, name) == 0) return &gf->tensors[i];
+    return NULL;
+}
+
+// Get raw data pointer for a tensor
+static const uint8_t *gguf_tensor_data(GGUFFile *gf, GGUFTensor *t) {
+    return gf->data + gf->data_start + t->offset;
+}
+
+// Load Q1_0_g128 tensor and dequantize to fp16 for ANE
+static _Float16 *gguf_load_q1_fp16(GGUFFile *gf, const char *name, int *out_rows, int *out_cols) {
+    GGUFTensor *t = gguf_find(gf, name);
+    if (!t) { fprintf(stderr, "GGUF: tensor '%s' not found\n", name); return NULL; }
+    if (t->dtype != GGUF_TYPE_Q1_0_G128) {
+        fprintf(stderr, "GGUF: tensor '%s' is dtype %d, expected Q1_0_g128 (%d)\n",
+                name, t->dtype, GGUF_TYPE_Q1_0_G128);
+        return NULL;
+    }
+    if (t->n_dims != 2) {
+        fprintf(stderr, "GGUF: tensor '%s' has %d dims, expected 2\n", name, t->n_dims);
+        return NULL;
+    }
+    *out_rows = (int)t->dims[1];  // GGUF dims are reversed (row-major: [cols, rows])
+    *out_cols = (int)t->dims[0];
+    const Q1Block *blocks = (const Q1Block *)gguf_tensor_data(gf, t);
+    return q1_dequantize_fp16(blocks, (int)t->n_elements);
+}
+
+// Load F16 tensor (for LoRA adapters)
+static _Float16 *gguf_load_f16(GGUFFile *gf, const char *name, int *out_rows, int *out_cols) {
+    GGUFTensor *t = gguf_find(gf, name);
+    if (!t) { fprintf(stderr, "GGUF: tensor '%s' not found\n", name); return NULL; }
+    if (t->dtype != GGUF_TYPE_F16) {
+        fprintf(stderr, "GGUF: tensor '%s' is dtype %d, expected F16 (%d)\n",
+                name, t->dtype, GGUF_TYPE_F16);
+        return NULL;
+    }
+    *out_rows = (int)(t->n_dims >= 2 ? t->dims[1] : 1);
+    *out_cols = (int)t->dims[0];
+    _Float16 *out = (_Float16 *)malloc(t->n_elements * 2);
+    memcpy(out, gguf_tensor_data(gf, t), t->n_elements * 2);
+    return out;
+}
+
+static void gguf_close(GGUFFile *gf) {
+    if (!gf) return;
+    munmap(gf->data, gf->file_size);
+    close(gf->fd);
+    free(gf->tensors);
+    free(gf);
+}
+
 // ===== MIL generators =====
 
 // Generate MIL for LoRA-fused conv:
@@ -145,7 +341,11 @@ static NSData *bonsai_build_lora_blob(const float *W, int out_ch, int in_ch,
 // Input:  [1, in_ch, 1, spatial] fp32
 // Output: [1, out_ch, 1, spatial] fp32
 // Weights in separate files: w.bin[out_ch,in_ch], lora_b.bin[rank,in_ch], lora_a.bin[out_ch,rank]
+// Default LoRA alpha (Bonsai uses alpha=32, rank=16 → scale=2.0)
+#define BONSAI_LORA_ALPHA 32.0f
+
 static NSString *bonsai_gen_lora_conv(int in_ch, int out_ch, int rank, int spatial) {
+    float lora_scale = BONSAI_LORA_ALPHA / (float)rank;
     return [NSString stringWithFormat:
         @"program(1.3)\n"
         "[buildInfo = dict<string, string>({{\"coremlc-component-MIL\", \"3510.2.1\"}, "
@@ -170,7 +370,9 @@ static NSString *bonsai_gen_lora_conv(int in_ch, int out_ch, int rank, int spati
         "pad = pad, pad_type = pad_type, strides = strides, weight = B, x = x)[name = string(\"conv_b\")];\n"
         "        tensor<fp16, [1, %d, 1, %d]> abx = conv(dilations = dilations, groups = groups, "
         "pad = pad, pad_type = pad_type, strides = strides, weight = A, x = bx)[name = string(\"conv_a\")];\n"
-        "        tensor<fp16, [1, %d, 1, %d]> y = add(x = wx, y = abx)[name = string(\"lora_add\")];\n"
+        "        fp16 lora_scale = const()[name = string(\"lora_scale\"), val = fp16(%.1f)];\n"
+        "        tensor<fp16, [1, %d, 1, %d]> sabx = mul(x = abx, y = lora_scale)[name = string(\"scale_lora\")];\n"
+        "        tensor<fp16, [1, %d, 1, %d]> y = add(x = wx, y = sabx)[name = string(\"lora_add\")];\n"
         "    } -> (y);\n"
         "}\n",
         in_ch, spatial,                                    // input
@@ -180,6 +382,8 @@ static NSString *bonsai_gen_lora_conv(int in_ch, int out_ch, int rank, int spati
         out_ch, spatial,                                   // conv_w
         rank, spatial,                                     // conv_b
         out_ch, spatial,                                   // conv_a
+        lora_scale,                                        // scale value
+        out_ch, spatial,                                   // scale_lora
         out_ch, spatial];                                  // lora_add
 }
 

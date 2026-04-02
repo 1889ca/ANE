@@ -9,9 +9,10 @@
 static mach_timebase_info_data_t tb;
 static double tms(uint64_t t) { return (double)t * tb.numer / tb.denom / 1e6; }
 
-// CPU reference: y = W@x + A@(B@x)
+// CPU reference: y = W@x + (alpha/rank) * A@(B@x)
 static void cpu_lora_matmul(float *y, const float *W, const float *A, const float *B,
                              const float *x, int out_ch, int in_ch, int rank, int spatial) {
+    float lora_scale = BONSAI_LORA_ALPHA / (float)rank;
     // W@x → y [out_ch, spatial]
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                 out_ch, spatial, in_ch, 1.0f, W, in_ch, x, spatial, 0.0f, y, spatial);
@@ -19,9 +20,9 @@ static void cpu_lora_matmul(float *y, const float *W, const float *A, const floa
     float *tmp = (float *)malloc((size_t)rank * spatial * sizeof(float));
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                 rank, spatial, in_ch, 1.0f, B, in_ch, x, spatial, 0.0f, tmp, spatial);
-    // A@tmp → y += [out_ch, spatial]
+    // A@tmp → y += scale * [out_ch, spatial]
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                out_ch, spatial, rank, 1.0f, A, rank, tmp, spatial, 1.0f, y, spatial);
+                out_ch, spatial, rank, lora_scale, A, rank, tmp, spatial, 1.0f, y, spatial);
     free(tmp);
 }
 
@@ -104,16 +105,16 @@ int main(int argc, char *argv[]) {
             float out[256];
             q1_dequantize(out, blocks, n_weights);
 
-            // Verify: even indices should be +scale, odd should be -scale
+            // Verify: 0xAA = 10101010, bit0=0→-s, bit1=1→+s, bit2=0→-s, bit3=1→+s
             bool ok = true;
             for (int i = 0; i < 8; i++) {
-                float expected_even = (float)blocks[i/128].scale;
-                float expected_odd = -(float)blocks[i/128].scale;
+                float expected_even = -(float)blocks[i/128].scale;   // bit=0 → -scale
+                float expected_odd = (float)blocks[i/128].scale;     // bit=1 → +scale
                 if (fabsf(out[i*2] - expected_even) > 1e-4f) ok = false;
                 if (fabsf(out[i*2+1] - expected_odd) > 1e-4f) ok = false;
             }
             printf("  Q1 dequant: %s\n", ok ? "PASS" : "FAIL");
-            printf("  Sample: [%.4f, %.4f, %.4f, %.4f] (expect [+s, -s, +s, -s])\n",
+            printf("  Sample: [%.4f, %.4f, %.4f, %.4f] (expect [-s, +s, -s, +s])\n",
                    out[0], out[1], out[2], out[3]);
         }
 
@@ -250,6 +251,72 @@ int main(int argc, char *argv[]) {
             }
 
             free(W); free(A); free(B); free(x); free(y_lora); free(y_plain);
+        }
+
+        // ===== Test 5: Load actual Bonsai-8B GGUF =====
+        printf("\n--- Test 5: Load Bonsai-8B GGUF ---\n");
+        {
+            const char *gguf_path = "/Users/mcm/Development/fastr/models/Bonsai-8B.gguf";
+            GGUFFile *gf = gguf_open(gguf_path);
+            if (gf) {
+                printf("  Tensors: %llu\n", gf->n_tensors);
+
+                // List first 10 tensors
+                printf("  First 10 tensors:\n");
+                for (int i = 0; i < 10 && i < (int)gf->n_tensors; i++) {
+                    GGUFTensor *t = &gf->tensors[i];
+                    printf("    [%d] %s  dtype=%d  dims=[", i, t->name, t->dtype);
+                    for (uint32_t d = 0; d < t->n_dims; d++)
+                        printf("%s%llu", d ? "," : "", t->dims[d]);
+                    printf("]  %llu elements  %llu bytes\n", t->n_elements, t->data_size);
+                }
+
+                // Try loading layer 0 Q projection
+                int rows, cols;
+                uint64_t t0 = mach_absolute_time();
+                _Float16 *wq = gguf_load_q1_fp16(gf, "blk.0.attn_q.weight", &rows, &cols);
+                double load_ms = tms(mach_absolute_time() - t0);
+                if (wq) {
+                    printf("\n  Loaded blk.0.attn_q.weight: [%d, %d] in %.1fms\n", rows, cols, load_ms);
+                    printf("  Sample values: [%.4f, %.4f, %.4f, %.4f]\n",
+                           (float)wq[0], (float)wq[1], (float)wq[2], (float)wq[3]);
+                    // Stats
+                    float min_v = 1e9, max_v = -1e9;
+                    double sum = 0;
+                    int n = rows * cols;
+                    for (int i = 0; i < n; i++) {
+                        float v = (float)wq[i];
+                        if (v < min_v) min_v = v;
+                        if (v > max_v) max_v = v;
+                        sum += fabsf(v);
+                    }
+                    printf("  Stats: min=%.4f max=%.4f mean_abs=%.4f\n", min_v, max_v, sum / n);
+
+                    // Compile and benchmark an ANE kernel with real Bonsai weights
+                    t0 = mach_absolute_time();
+                    NSData *blob = bonsai_build_blob_fp16(wq, rows, cols);
+                    NSDictionary *wdict = @{@"@model_path/weights/w.bin": @{@"offset": @0, @"data": blob}};
+                    NSString *mil = bonsai_gen_conv(cols, rows, 256);
+                    Kern *k = compile_kern_mil_w(mil, wdict, cols * 256 * 2, rows * 256 * 2);
+                    double total_ms = tms(mach_absolute_time() - t0);
+                    if (k) {
+                        // Benchmark
+                        for (int i = 0; i < 5; i++) ane_eval(k);
+                        t0 = mach_absolute_time();
+                        for (int i = 0; i < 50; i++) ane_eval(k);
+                        double eval_ms = tms(mach_absolute_time() - t0) / 50;
+                        double tflops = 2.0 * rows * cols * 256 / eval_ms / 1e9;
+                        printf("  ANE eval with real weights: %.3fms (%.2f TFLOPS) compile=%.1fms\n",
+                               eval_ms, tflops, total_ms);
+                        free_kern(k);
+                    }
+                    free(wq);
+                } else {
+                    printf("  Could not load Q weight (check tensor name)\n");
+                }
+
+                gguf_close(gf);
+            }
         }
 
         // ===== Summary =====
