@@ -1,42 +1,38 @@
-// infer_metal.h — Metal GPU compute for FFN matrix-vector multiply
-// Uses fp16 weights in shared memory (zero-copy on Apple Silicon unified memory)
-// Replaces the 199ms ANE FFN kernel with fast GPU matmul
+// infer_metal.h — Full Metal GPU inference for all projections
+// Replaces ANE for large models where baked-weight eval overhead dominates
+// Uses shared memory (zero-copy on Apple Silicon unified memory)
 #pragma once
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
 #include "infer_config.h"
 
-// Metal compute shader source — fp16 matvec + fused silu*gate + matvec
 static NSString *const metal_shader_source = @R"(
 #include <metal_stdlib>
 using namespace metal;
 
-// Matrix-vector multiply: out[i] = sum_j(W[i*K + j] * x[j])
-// W: [M, K] row-major fp16, x: [K] fp16, out: [M] fp16
-// Each thread computes one output row
+// Matrix-vector multiply: one threadgroup (32 threads) per output row
+// 32 threads collaboratively sum K elements via simd_sum
 kernel void matvec_f16(
     device const half *W [[buffer(0)]],
     device const half *x [[buffer(1)]],
     device half *out [[buffer(2)]],
     constant uint &K [[buffer(3)]],
-    uint i [[thread_position_in_grid]])
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]])
 {
     float sum = 0.0f;
-    uint base = i * K;
-    // Vectorized 4-wide accumulation
-    uint j = 0;
-    for (; j + 3 < K; j += 4) {
+    uint base = row * K;
+    // Stride by 32 threads, each accumulates K/32 elements
+    for (uint j = lane * 4; j < K; j += 128) {
         half4 w = *reinterpret_cast<device const half4*>(W + base + j);
         half4 v = *reinterpret_cast<device const half4*>(x + j);
         sum += dot(float4(w), float4(v));
     }
-    for (; j < K; j++)
-        sum += float(W[base + j]) * float(x[j]);
-    out[i] = half(sum);
+    sum = simd_sum(sum);
+    if (lane == 0) out[row] = half(sum);
 }
 
 // Fused SiLU gate: out[i] = silu(h1[i]) * h3[i]
-// silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
 kernel void silu_gate_f16(
     device const half *h1 [[buffer(0)]],
     device const half *h3 [[buffer(1)]],
@@ -49,33 +45,38 @@ kernel void silu_gate_f16(
 }
 )";
 
-// Per-layer Metal FFN state
+// Per-layer weight buffers
 typedef struct {
-    id<MTLBuffer> W1;    // [hidden, dim] fp16, shared memory
+    id<MTLBuffer> Wqkv;  // fused [dim + 2*kv_dim, dim] fp16
+    id<MTLBuffer> Wo;    // [dim, dim] fp16
+    id<MTLBuffer> W1;    // [hidden, dim] fp16
     id<MTLBuffer> W3;    // [hidden, dim] fp16
     id<MTLBuffer> W2;    // [dim, hidden] fp16
-} MetalFFNLayer;
+} MetalLayerWeights;
 
-// Global Metal state
 typedef struct {
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
-    id<MTLComputePipelineState> matvec_pipeline;
-    id<MTLComputePipelineState> silu_gate_pipeline;
-    id<MTLBuffer> buf_x;       // [dim] fp16 input
-    id<MTLBuffer> buf_h1;      // [hidden] fp16 intermediate
-    id<MTLBuffer> buf_h3;      // [hidden] fp16 intermediate
-    id<MTLBuffer> buf_gate;    // [hidden] fp16 after silu*gate
-    id<MTLBuffer> buf_out;     // [dim] fp16 output
-    id<MTLBuffer> buf_K;       // uint32 constant
-    MetalFFNLayer *layers;
-    int n_layers;
-    int dim, hidden_dim;
-} MetalFFN;
+    id<MTLComputePipelineState> matvec_pipe;
+    id<MTLComputePipelineState> silu_gate_pipe;
+    // Shared I/O buffers (reused across layers)
+    id<MTLBuffer> buf_x;       // [dim] input
+    id<MTLBuffer> buf_qkv;     // [dim + 2*kv_dim] QKV output
+    id<MTLBuffer> buf_attn;    // [dim] attention output (for Wo)
+    id<MTLBuffer> buf_wo;      // [dim] Wo output
+    id<MTLBuffer> buf_ffn_in;  // [dim] FFN input (after rmsnorm)
+    id<MTLBuffer> buf_h13;     // [2*hidden] fused W1+W3 output
+    id<MTLBuffer> buf_gate;    // [hidden] after silu*gate
+    id<MTLBuffer> buf_ffn_out; // [dim] FFN output
+    MetalLayerWeights *layers;
+    int n_layers, dim, kv_dim, hidden_dim;
+    NSUInteger tgSize;
+} MetalInfer;
 
-static MetalFFN *metal_ffn_init(const InferConfig *cfg) {
-    MetalFFN *m = (MetalFFN *)calloc(1, sizeof(MetalFFN));
+static MetalInfer *metal_init(const InferConfig *cfg) {
+    MetalInfer *m = (MetalInfer *)calloc(1, sizeof(MetalInfer));
     m->dim = cfg->dim;
+    m->kv_dim = cfg->kv_dim;
     m->hidden_dim = cfg->hidden_dim;
     m->n_layers = cfg->n_layers;
 
@@ -83,103 +84,229 @@ static MetalFFN *metal_ffn_init(const InferConfig *cfg) {
     if (!m->device) { fprintf(stderr, "Metal: no device\n"); free(m); return NULL; }
     m->queue = [m->device newCommandQueue];
 
-    // Compile shaders
     NSError *err = nil;
     id<MTLLibrary> lib = [m->device newLibraryWithSource:metal_shader_source options:nil error:&err];
-    if (!lib) {
-        fprintf(stderr, "Metal shader compile: %s\n", [[err description] UTF8String]);
-        free(m); return NULL;
-    }
+    if (!lib) { fprintf(stderr, "Metal compile: %s\n", [[err description] UTF8String]); free(m); return NULL; }
 
-    id<MTLFunction> matvec_fn = [lib newFunctionWithName:@"matvec_f16"];
-    id<MTLFunction> silu_gate_fn = [lib newFunctionWithName:@"silu_gate_f16"];
-    m->matvec_pipeline = [m->device newComputePipelineStateWithFunction:matvec_fn error:&err];
-    m->silu_gate_pipeline = [m->device newComputePipelineStateWithFunction:silu_gate_fn error:&err];
+    m->matvec_pipe = [m->device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"matvec_f16"] error:&err];
+    m->silu_gate_pipe = [m->device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"silu_gate_f16"] error:&err];
+    m->tgSize = m->matvec_pipe.maxTotalThreadsPerThreadgroup;
+    if (m->tgSize > 256) m->tgSize = 256;
 
-    // Allocate I/O buffers (shared memory)
-    m->buf_x    = [m->device newBufferWithLength:cfg->dim * 2 options:MTLResourceStorageModeShared];
-    m->buf_h1   = [m->device newBufferWithLength:cfg->hidden_dim * 2 options:MTLResourceStorageModeShared];
-    m->buf_h3   = [m->device newBufferWithLength:cfg->hidden_dim * 2 options:MTLResourceStorageModeShared];
-    m->buf_gate = [m->device newBufferWithLength:cfg->hidden_dim * 2 options:MTLResourceStorageModeShared];
-    m->buf_out  = [m->device newBufferWithLength:cfg->dim * 2 options:MTLResourceStorageModeShared];
+    int qkv_dim = cfg->dim + 2 * cfg->kv_dim;
+    m->buf_x       = [m->device newBufferWithLength:cfg->dim * 2      options:MTLResourceStorageModeShared];
+    m->buf_qkv     = [m->device newBufferWithLength:qkv_dim * 2       options:MTLResourceStorageModeShared];
+    m->buf_attn    = [m->device newBufferWithLength:cfg->dim * 2      options:MTLResourceStorageModeShared];
+    m->buf_wo      = [m->device newBufferWithLength:cfg->dim * 2      options:MTLResourceStorageModeShared];
+    m->buf_ffn_in  = [m->device newBufferWithLength:cfg->dim * 2      options:MTLResourceStorageModeShared];
+    m->buf_h13     = [m->device newBufferWithLength:cfg->hidden_dim*2*2 options:MTLResourceStorageModeShared];
+    m->buf_gate    = [m->device newBufferWithLength:cfg->hidden_dim * 2 options:MTLResourceStorageModeShared];
+    m->buf_ffn_out = [m->device newBufferWithLength:cfg->dim * 2      options:MTLResourceStorageModeShared];
 
-    m->layers = (MetalFFNLayer *)calloc(cfg->n_layers, sizeof(MetalFFNLayer));
+    m->layers = (MetalLayerWeights *)calloc(cfg->n_layers, sizeof(MetalLayerWeights));
 
-    printf("Metal: %s — FFN buffers allocated\n", [[m->device name] UTF8String]);
+    printf("Metal: %s — full inference pipeline\n", [[m->device name] UTF8String]);
     return m;
 }
 
-// Load weights for one layer (fp16, shared memory = zero-copy)
-static void metal_ffn_load_layer(MetalFFN *m, int L,
-                                  const _Float16 *w1, const _Float16 *w3, const _Float16 *w2) {
-    size_t w1_sz = (size_t)m->hidden_dim * m->dim * 2;
-    size_t w2_sz = (size_t)m->dim * m->hidden_dim * 2;
-
-    // Use newBufferWithBytesNoCopy for true zero-copy on unified memory
-    // Falls back to copy if alignment doesn't work
-    m->layers[L].W1 = [m->device newBufferWithBytes:w1 length:w1_sz options:MTLResourceStorageModeShared];
-    m->layers[L].W3 = [m->device newBufferWithBytes:w3 length:w1_sz options:MTLResourceStorageModeShared];
-    m->layers[L].W2 = [m->device newBufferWithBytes:w2 length:w2_sz options:MTLResourceStorageModeShared];
+// Fuse Wq[dim,dim] + Wk[kv_dim,dim] + Wv[kv_dim,dim] into one [dim+2*kv_dim, dim] matrix
+static id<MTLBuffer> metal_fuse_qkv(MetalInfer *m,
+                                     const _Float16 *wq, const _Float16 *wk, const _Float16 *wv) {
+    int D = m->dim, KD = m->kv_dim;
+    int rows = D + 2 * KD;
+    size_t sz = (size_t)rows * D * 2;
+    _Float16 *fused = (_Float16 *)malloc(sz);
+    memcpy(fused, wq, (size_t)D * D * 2);
+    memcpy(fused + D * D, wk, (size_t)KD * D * 2);
+    memcpy(fused + (D + KD) * D, wv, (size_t)KD * D * 2);
+    id<MTLBuffer> buf = [m->device newBufferWithBytes:fused length:sz options:MTLResourceStorageModeShared];
+    free(fused);
+    return buf;
 }
 
-// Run FFN on Metal: x_norm → W1/W3 → silu*gate → W2 → delta
-// x_norm: [dim] fp16 (already RMSNorm'd), out: [dim] fp16 (FFN delta)
-static void metal_ffn_eval(MetalFFN *m, int L, const _Float16 *x_norm, _Float16 *out) {
-    // Copy input to Metal buffer
-    memcpy([m->buf_x contents], x_norm, m->dim * 2);
+static void metal_load_layer(MetalInfer *m, int L,
+                              const _Float16 *wq, const _Float16 *wk, const _Float16 *wv,
+                              const _Float16 *wo,
+                              const _Float16 *w1, const _Float16 *w3, const _Float16 *w2) {
+    int D = m->dim, KD = m->kv_dim, H = m->hidden_dim;
+    m->layers[L].Wqkv = metal_fuse_qkv(m, wq, wk, wv);
+    m->layers[L].Wo = [m->device newBufferWithBytes:wo length:(size_t)D*D*2 options:MTLResourceStorageModeShared];
+    m->layers[L].W1 = [m->device newBufferWithBytes:w1 length:(size_t)H*D*2 options:MTLResourceStorageModeShared];
+    m->layers[L].W3 = [m->device newBufferWithBytes:w3 length:(size_t)H*D*2 options:MTLResourceStorageModeShared];
+    m->layers[L].W2 = [m->device newBufferWithBytes:w2 length:(size_t)D*H*2 options:MTLResourceStorageModeShared];
+}
+
+// ===== Eval functions =====
+
+// QKV projection: x_norm[dim] → Q[dim], K[kv_dim], V[kv_dim]
+// Uses fused Wqkv matrix — one matvec dispatch
+static void metal_eval_qkv(MetalInfer *m, int L, const _Float16 *x_norm,
+                            _Float16 *q_out, _Float16 *k_out, _Float16 *v_out) {
+    int D = m->dim, KD = m->kv_dim;
+    memcpy([m->buf_x contents], x_norm, D * 2);
 
     @autoreleasepool {
     id<MTLCommandBuffer> cmd = [m->queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
-    uint32_t K;
-    NSUInteger tgSize = m->matvec_pipeline.maxTotalThreadsPerThreadgroup;
-    if (tgSize > 256) tgSize = 256;
-
-    // W1 @ x → h1 [hidden_dim]
-    K = (uint32_t)m->dim;
-    [enc setComputePipelineState:m->matvec_pipeline];
-    [enc setBuffer:m->layers[L].W1 offset:0 atIndex:0];
+    uint32_t K = (uint32_t)D;
+    [enc setComputePipelineState:m->matvec_pipe];
+    [enc setBuffer:m->layers[L].Wqkv offset:0 atIndex:0];
     [enc setBuffer:m->buf_x offset:0 atIndex:1];
-    [enc setBuffer:m->buf_h1 offset:0 atIndex:2];
+    [enc setBuffer:m->buf_qkv offset:0 atIndex:2];
     [enc setBytes:&K length:4 atIndex:3];
-    [enc dispatchThreads:MTLSizeMake(m->hidden_dim, 1, 1)
-        threadsPerThreadgroup:MTLSizeMake(tgSize, 1, 1)];
-
-    // W3 @ x → h3 [hidden_dim]
-    [enc setBuffer:m->layers[L].W3 offset:0 atIndex:0];
-    [enc setBuffer:m->buf_h3 offset:0 atIndex:2];
-    [enc dispatchThreads:MTLSizeMake(m->hidden_dim, 1, 1)
-        threadsPerThreadgroup:MTLSizeMake(tgSize, 1, 1)];
-
-    // silu(h1) * h3 → gate [hidden_dim]
-    [enc setComputePipelineState:m->silu_gate_pipeline];
-    [enc setBuffer:m->buf_h1 offset:0 atIndex:0];
-    [enc setBuffer:m->buf_h3 offset:0 atIndex:1];
-    [enc setBuffer:m->buf_gate offset:0 atIndex:2];
-    [enc dispatchThreads:MTLSizeMake(m->hidden_dim, 1, 1)
-        threadsPerThreadgroup:MTLSizeMake(tgSize, 1, 1)];
-
-    // W2 @ gate → out [dim]
-    K = (uint32_t)m->hidden_dim;
-    [enc setComputePipelineState:m->matvec_pipeline];
-    [enc setBuffer:m->layers[L].W2 offset:0 atIndex:0];
-    [enc setBuffer:m->buf_gate offset:0 atIndex:1];
-    [enc setBuffer:m->buf_out offset:0 atIndex:2];
-    [enc setBytes:&K length:4 atIndex:3];
-    [enc dispatchThreads:MTLSizeMake(m->dim, 1, 1)
-        threadsPerThreadgroup:MTLSizeMake(tgSize, 1, 1)];
+    [enc dispatchThreadgroups:MTLSizeMake(D + 2*KD, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
     [enc endEncoding];
     [cmd commit];
     [cmd waitUntilCompleted];
     }
 
-    // Copy output back
-    memcpy(out, [m->buf_out contents], m->dim * 2);
+    // Split fused output
+    const _Float16 *qkv = (const _Float16 *)[m->buf_qkv contents];
+    memcpy(q_out, qkv, D * 2);
+    memcpy(k_out, qkv + D, KD * 2);
+    memcpy(v_out, qkv + D + KD, KD * 2);
 }
 
-static void metal_ffn_free(MetalFFN *m) {
+// Wo projection: attn_out[dim] → wo_delta[dim]
+static void metal_eval_wo(MetalInfer *m, int L, const _Float16 *attn_out, _Float16 *wo_out) {
+    int D = m->dim;
+    memcpy([m->buf_attn contents], attn_out, D * 2);
+
+    @autoreleasepool {
+    id<MTLCommandBuffer> cmd = [m->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+    uint32_t K = (uint32_t)D;
+    [enc setComputePipelineState:m->matvec_pipe];
+    [enc setBuffer:m->layers[L].Wo offset:0 atIndex:0];
+    [enc setBuffer:m->buf_attn offset:0 atIndex:1];
+    [enc setBuffer:m->buf_wo offset:0 atIndex:2];
+    [enc setBytes:&K length:4 atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake(D, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    }
+
+    memcpy(wo_out, [m->buf_wo contents], D * 2);
+}
+
+// FFN: x_norm[dim] → W1/W3 → silu*gate → W2 → delta[dim]
+static void metal_eval_ffn(MetalInfer *m, int L, const _Float16 *x_norm, _Float16 *out) {
+    int D = m->dim, H = m->hidden_dim;
+    memcpy([m->buf_ffn_in contents], x_norm, D * 2);
+
+    @autoreleasepool {
+    id<MTLCommandBuffer> cmd = [m->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+    uint32_t K;
+
+    // W1 @ x → h1
+    K = (uint32_t)D;
+    [enc setComputePipelineState:m->matvec_pipe];
+    [enc setBuffer:m->layers[L].W1 offset:0 atIndex:0];
+    [enc setBuffer:m->buf_ffn_in offset:0 atIndex:1];
+    [enc setBuffer:m->buf_h13 offset:0 atIndex:2];  // h1 in first half
+    [enc setBytes:&K length:4 atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake(H, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+    // W3 @ x → h3 (offset into second half of buf_h13)
+    [enc setBuffer:m->layers[L].W3 offset:0 atIndex:0];
+    [enc setBuffer:m->buf_h13 offset:H*2 atIndex:2];  // h3 in second half
+    [enc dispatchThreadgroups:MTLSizeMake(H, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+    // silu(h1) * h3 → gate
+    [enc setComputePipelineState:m->silu_gate_pipe];
+    [enc setBuffer:m->buf_h13 offset:0 atIndex:0];    // h1
+    [enc setBuffer:m->buf_h13 offset:H*2 atIndex:1];  // h3
+    [enc setBuffer:m->buf_gate offset:0 atIndex:2];
+    [enc dispatchThreads:MTLSizeMake(H, 1, 1) threadsPerThreadgroup:MTLSizeMake(m->tgSize, 1, 1)];
+
+    // W2 @ gate → out
+    K = (uint32_t)H;
+    [enc setComputePipelineState:m->matvec_pipe];
+    [enc setBuffer:m->layers[L].W2 offset:0 atIndex:0];
+    [enc setBuffer:m->buf_gate offset:0 atIndex:1];
+    [enc setBuffer:m->buf_ffn_out offset:0 atIndex:2];
+    [enc setBytes:&K length:4 atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake(D, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    }
+
+    memcpy(out, [m->buf_ffn_out contents], D * 2);
+}
+
+// Full layer: QKV + Wo + FFN in one command buffer submission
+// Requires attention to be done on CPU between QKV and Wo
+// So we split into: qkv_eval → [cpu attention] → wo_ffn_eval
+static void metal_eval_wo_ffn(MetalInfer *m, int L,
+                               const _Float16 *attn_out,    // [dim] from CPU attention
+                               const _Float16 *ffn_x_norm,  // [dim] RMSNorm'd for FFN
+                               _Float16 *wo_out,             // [dim] Wo projection delta
+                               _Float16 *ffn_out) {          // [dim] FFN delta
+    int D = m->dim, H = m->hidden_dim;
+    memcpy([m->buf_attn contents], attn_out, D * 2);
+    memcpy([m->buf_ffn_in contents], ffn_x_norm, D * 2);
+
+    @autoreleasepool {
+    id<MTLCommandBuffer> cmd = [m->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+    uint32_t K;
+
+    // Wo @ attn_out → wo_delta
+    K = (uint32_t)D;
+    [enc setComputePipelineState:m->matvec_pipe];
+    [enc setBuffer:m->layers[L].Wo offset:0 atIndex:0];
+    [enc setBuffer:m->buf_attn offset:0 atIndex:1];
+    [enc setBuffer:m->buf_wo offset:0 atIndex:2];
+    [enc setBytes:&K length:4 atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake(D, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+    // W1 @ ffn_x_norm → h1
+    [enc setBuffer:m->layers[L].W1 offset:0 atIndex:0];
+    [enc setBuffer:m->buf_ffn_in offset:0 atIndex:1];
+    [enc setBuffer:m->buf_h13 offset:0 atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake(H, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+    // W3 @ ffn_x_norm → h3
+    [enc setBuffer:m->layers[L].W3 offset:0 atIndex:0];
+    [enc setBuffer:m->buf_h13 offset:H*2 atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake(H, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+    // silu(h1) * h3 → gate
+    [enc setComputePipelineState:m->silu_gate_pipe];
+    [enc setBuffer:m->buf_h13 offset:0 atIndex:0];
+    [enc setBuffer:m->buf_h13 offset:H*2 atIndex:1];
+    [enc setBuffer:m->buf_gate offset:0 atIndex:2];
+    [enc dispatchThreads:MTLSizeMake(H, 1, 1) threadsPerThreadgroup:MTLSizeMake(m->tgSize, 1, 1)];
+
+    // W2 @ gate → ffn_out
+    K = (uint32_t)H;
+    [enc setComputePipelineState:m->matvec_pipe];
+    [enc setBuffer:m->layers[L].W2 offset:0 atIndex:0];
+    [enc setBuffer:m->buf_gate offset:0 atIndex:1];
+    [enc setBuffer:m->buf_ffn_out offset:0 atIndex:2];
+    [enc setBytes:&K length:4 atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake(D, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    }
+
+    memcpy(wo_out, [m->buf_wo contents], D * 2);
+    memcpy(ffn_out, [m->buf_ffn_out contents], D * 2);
+}
+
+static void metal_free(MetalInfer *m) {
     if (!m) return;
     free(m->layers);
     free(m);

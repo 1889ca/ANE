@@ -401,7 +401,7 @@ int main(int argc, char **argv) {
     _Float16 **wo_weights = NULL; // [n_layers] Wo weight arrays for CPU attention
     InferLayerKernels *layers = NULL;
     _Float16 *rms_final_w = NULL;
-    MetalFFN *metal_ffn = NULL;  // Metal FFN for large models (NULL = use ANE)
+    MetalInfer *metal = NULL;    // Full Metal inference (NULL = use ANE)
 
     if (use_stories) {
         // ====== Stories110M path (for testing) ======
@@ -590,13 +590,12 @@ int main(int argc, char **argv) {
         rms_final_w = gguf_load_as_f16(gf, "output_norm.weight", &rr, &rc);
         if (!rms_final_w) { fprintf(stderr, "Failed to load output_norm\n"); return 1; }
 
-        // Init Metal FFN
-        metal_ffn = metal_ffn_init(&cfg);
+        // Init Metal for FFN (QKV + Wo stay on ANE — lower latency for small matmuls)
+        metal = metal_init(&cfg);
 
-        // Compile ANE kernels per layer (QKV + Wo on ANE, FFN on Metal)
-        printf("Compiling %d layers...\n", cfg.n_layers);
+        // Compile ANE kernels (QKV + Wo) + Metal FFN per layer
+        printf("Compiling %d layers (ANE QKV+Wo, Metal FFN)...\n", cfg.n_layers);
         layers = (InferLayerKernels *)calloc(cfg.n_layers, sizeof(InferLayerKernels));
-        wo_weights = (_Float16 **)calloc(cfg.n_layers, sizeof(_Float16*));
 
         for (int L = 0; L < cfg.n_layers; L++) {
             printf("  Layer %d/%d\r", L+1, cfg.n_layers); fflush(stdout);
@@ -660,7 +659,7 @@ int main(int argc, char **argv) {
                 xor_patch_apply_f16(w2_f16, cfg.dim, cfg.hidden_dim, xor_patch, L, XOR_PROJ_DOWN);
             }
 
-            // QKV kernel (no RMSNorm — done on CPU in fp32)
+            // QKV + Wo on ANE (low-latency for dim×dim matmuls)
             int io_s = DECODE_S;
             NSString *qkv_mil = gen_infer_qkv(&cfg, io_s);
             NSDictionary *qkv_w = @{
@@ -671,26 +670,15 @@ int main(int argc, char **argv) {
             layers[L].qkv = compile_kern_mil_w(qkv_mil, qkv_w,
                 cfg.dim*io_s*2, (cfg.dim+2*cfg.kv_dim)*io_s*2);
 
-            // Wo projection kernel (ANE)
             NSString *wo_mil = gen_infer_wo(&cfg, io_s);
             NSDictionary *wo_w = @{
                 @"@model_path/weights/wo.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(wo_f16, cfg.dim, cfg.dim)},
             };
             layers[L].wo = compile_kern_mil_w(wo_mil, wo_w, cfg.dim*io_s*2, cfg.dim*io_s*2);
 
-            // FFN on Metal GPU (not ANE — too slow for 300MB weights)
-            if (metal_ffn) {
-                metal_ffn_load_layer(metal_ffn, L, w1_f16, w3_f16, w2_f16);
-                layers[L].ffn = NULL;  // no ANE FFN kernel
-            } else {
-                NSString *ffn_mil = gen_infer_ffn(&cfg, io_s);
-                NSDictionary *ffn_w = @{
-                    @"@model_path/weights/w1.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(w1_f16, cfg.hidden_dim, cfg.dim)},
-                    @"@model_path/weights/w3.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(w3_f16, cfg.hidden_dim, cfg.dim)},
-                    @"@model_path/weights/w2.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(w2_f16, cfg.dim, cfg.hidden_dim)},
-                };
-                layers[L].ffn = compile_kern_mil_w(ffn_mil, ffn_w, cfg.dim*io_s*2, cfg.dim*io_s*2);
-            }
+            // FFN on Metal GPU (300MB weights — too large for ANE baked-weight eval)
+            metal_load_layer(metal, L, wq_f16, wk_f16, wv_f16, wo_f16,
+                            w1_f16, w3_f16, w2_f16);
 
             // Store RMS norm weights for CPU, QK norm weights
             layers[L].rms_att = rms1; rms1 = NULL;
@@ -698,7 +686,7 @@ int main(int argc, char **argv) {
             layers[L].q_norm = qnorm;
             layers[L].k_norm = knorm;
 
-            // Free weights (baked into ANE kernels or copied to Metal buffers)
+            // Free weights (copied to Metal buffers)
             free(wq_f16); free(wk_f16); free(wv_f16); free(wo_f16);
             free(w1_f16); free(w2_f16); free(w3_f16);
         }
@@ -765,7 +753,7 @@ int main(int argc, char **argv) {
     uint64_t t_start = mach_absolute_time();
     int generated = 0;
 
-    double t_ane = 0, t_attn = 0, t_cls = 0, t_other = 0;
+    double t_ane = 0, t_attn = 0, t_cls = 0;
 
     // Process tokens one at a time (simple decode loop, no prefill optimization yet)
     for (int pos = 0; pos < n_tokens + max_tokens - 1; pos++) {
@@ -778,104 +766,87 @@ int main(int argc, char **argv) {
 
         // Process through all layers
         for (int L = 0; L < cfg.n_layers; L++) {
-            uint64_t t0 = mach_absolute_time(), ta, tb;
-            // CPU RMSNorm (fp32→fp16) then QKV projection on ANE
+            uint64_t t0 = mach_absolute_time();
+
+            // === QKV projection (Metal or ANE) ===
             rmsnorm_f32_to_f16(cfg.dim, x_f16, x, layers[L].rms_att);
-
-            IOSurfaceLock(layers[L].qkv->ioIn, 0, NULL);
-            _Float16 *qkv_inp = (_Float16*)IOSurfaceGetBaseAddress(layers[L].qkv->ioIn);
-            memset(qkv_inp, 0, cfg.dim * DECODE_S * sizeof(_Float16));
-            for (int ci = 0; ci < cfg.dim; ci++)
-                qkv_inp[ci * DECODE_S] = x_f16[ci];
-            IOSurfaceUnlock(layers[L].qkv->ioIn, 0, NULL);
-
-            ta = mach_absolute_time();
-            ane_eval(layers[L].qkv);
-            tb = mach_absolute_time();
+            if (0 && metal) {
+                metal_eval_qkv(metal, L, x_f16, q_buf, k_buf, v_buf);
+            } else {
+                IOSurfaceLock(layers[L].qkv->ioIn, 0, NULL);
+                _Float16 *qkv_inp = (_Float16*)IOSurfaceGetBaseAddress(layers[L].qkv->ioIn);
+                memset(qkv_inp, 0, cfg.dim * DECODE_S * sizeof(_Float16));
+                for (int ci = 0; ci < cfg.dim; ci++) qkv_inp[ci * DECODE_S] = x_f16[ci];
+                IOSurfaceUnlock(layers[L].qkv->ioIn, 0, NULL);
+                ane_eval(layers[L].qkv);
+                IOSurfaceLock(layers[L].qkv->ioOut, kIOSurfaceLockReadOnly, NULL);
+                const _Float16 *qo = (const _Float16*)IOSurfaceGetBaseAddress(layers[L].qkv->ioOut);
+                for (int ci = 0; ci < cfg.dim; ci++) q_buf[ci] = qo[ci * DECODE_S];
+                for (int ci = 0; ci < cfg.kv_dim; ci++) k_buf[ci] = qo[(cfg.dim + ci) * DECODE_S];
+                for (int ci = 0; ci < cfg.kv_dim; ci++) v_buf[ci] = qo[(cfg.dim + cfg.kv_dim + ci) * DECODE_S];
+                IOSurfaceUnlock(layers[L].qkv->ioOut, kIOSurfaceLockReadOnly, NULL);
+            }
             uint64_t t1 = mach_absolute_time();
 
-            // Read QKV output — channel-first [dim+2*kv_dim, DECODE_S], extract position 0
-            IOSurfaceLock(layers[L].qkv->ioOut, kIOSurfaceLockReadOnly, NULL);
-            const _Float16 *qkv_outp = (const _Float16*)IOSurfaceGetBaseAddress(layers[L].qkv->ioOut);
-            int qkv_S = DECODE_S;
-            // Q: channels [0, dim), K: [dim, dim+kv_dim), V: [dim+kv_dim, dim+2*kv_dim)
-            for (int ci = 0; ci < cfg.dim; ci++)
-                q_buf[ci] = qkv_outp[ci * qkv_S];
-            for (int ci = 0; ci < cfg.kv_dim; ci++)
-                k_buf[ci] = qkv_outp[(cfg.dim + ci) * qkv_S];
-            for (int ci = 0; ci < cfg.kv_dim; ci++)
-                v_buf[ci] = qkv_outp[(cfg.dim + cfg.kv_dim + ci) * qkv_S];
-
-            IOSurfaceUnlock(layers[L].qkv->ioOut, kIOSurfaceLockReadOnly, NULL);
-
-            // QK norm (Qwen3): per-head RMSNorm on Q and K before RoPE
+            // QK norm, RoPE, KV cache append
             if (cfg.qk_norm && layers[L].q_norm)
                 qk_norm_f16(&cfg, q_buf, k_buf, layers[L].q_norm, layers[L].k_norm);
-
-            // RoPE on Q and K for this position
             rope_single_pos(&cfg, q_buf, k_buf, pos);
-
-            // Append K, V to cache
             kv_cache_append1(kv, L, k_buf, v_buf);
 
-            uint64_t t2 = mach_absolute_time();
-            // CPU attention decode → raw attention output [dim]
+            // === CPU attention decode ===
             int T = pos + 1;
             cpu_attn_decode(&cfg, q_buf, kv->layers[L].k, kv->layers[L].v,
                            delta_f16, T, attn_scratch);
+            uint64_t t2 = mach_absolute_time();
 
-            // Wo projection on ANE: attn_out → Wo @ attn_out
-            IOSurfaceLock(layers[L].wo->ioIn, 0, NULL);
-            _Float16 *wo_inp = (_Float16*)IOSurfaceGetBaseAddress(layers[L].wo->ioIn);
-            memset(wo_inp, 0, cfg.dim * DECODE_S * sizeof(_Float16));
-            for (int ci = 0; ci < cfg.dim; ci++)
-                wo_inp[ci * DECODE_S] = delta_f16[ci];
-            IOSurfaceUnlock(layers[L].wo->ioIn, 0, NULL);
+            // === Wo + FFN (Metal or ANE) ===
+            if (metal) {
+                // ANE Wo projection
+                IOSurfaceLock(layers[L].wo->ioIn, 0, NULL);
+                _Float16 *wo_inp = (_Float16*)IOSurfaceGetBaseAddress(layers[L].wo->ioIn);
+                memset(wo_inp, 0, cfg.dim * DECODE_S * sizeof(_Float16));
+                for (int ci = 0; ci < cfg.dim; ci++) wo_inp[ci * DECODE_S] = delta_f16[ci];
+                IOSurfaceUnlock(layers[L].wo->ioIn, 0, NULL);
+                ane_eval(layers[L].wo);
+                IOSurfaceLock(layers[L].wo->ioOut, kIOSurfaceLockReadOnly, NULL);
+                const _Float16 *wo_out = (const _Float16*)IOSurfaceGetBaseAddress(layers[L].wo->ioOut);
+                for (int ci = 0; ci < cfg.dim; ci++) x[ci] += (float)wo_out[ci * DECODE_S];
+                IOSurfaceUnlock(layers[L].wo->ioOut, kIOSurfaceLockReadOnly, NULL);
 
-            ta = mach_absolute_time();
-            ane_eval(layers[L].wo);
-            tb = mach_absolute_time();
-
-            IOSurfaceLock(layers[L].wo->ioOut, kIOSurfaceLockReadOnly, NULL);
-            const _Float16 *wo_outp = (const _Float16*)IOSurfaceGetBaseAddress(layers[L].wo->ioOut);
-            for (int ci = 0; ci < cfg.dim; ci++)
-                x[ci] += (float)wo_outp[ci * DECODE_S];  // residual add in fp32
-            IOSurfaceUnlock(layers[L].wo->ioOut, kIOSurfaceLockReadOnly, NULL);
-
-
-            uint64_t t3 = mach_absolute_time();
-            // CPU RMSNorm then FFN (Metal GPU or ANE)
-            rmsnorm_f32_to_f16(cfg.dim, x_f16, x, layers[L].rms_ffn);
-
-            ta = mach_absolute_time();
-            if (metal_ffn) {
-                // Metal GPU FFN
-                metal_ffn_eval(metal_ffn, L, x_f16, delta_f16);
+                // Metal FFN
+                rmsnorm_f32_to_f16(cfg.dim, x_f16, x, layers[L].rms_ffn);
+                metal_eval_ffn(metal, L, x_f16, delta_f16);
                 for (int ci = 0; ci < cfg.dim; ci++)
-                    x[ci] += (float)delta_f16[ci];  // residual add in fp32
+                    x[ci] += (float)delta_f16[ci];
             } else {
+                // ANE Wo
+                IOSurfaceLock(layers[L].wo->ioIn, 0, NULL);
+                _Float16 *wo_inp = (_Float16*)IOSurfaceGetBaseAddress(layers[L].wo->ioIn);
+                memset(wo_inp, 0, cfg.dim * DECODE_S * sizeof(_Float16));
+                for (int ci = 0; ci < cfg.dim; ci++) wo_inp[ci * DECODE_S] = delta_f16[ci];
+                IOSurfaceUnlock(layers[L].wo->ioIn, 0, NULL);
+                ane_eval(layers[L].wo);
+                IOSurfaceLock(layers[L].wo->ioOut, kIOSurfaceLockReadOnly, NULL);
+                const _Float16 *wo_out = (const _Float16*)IOSurfaceGetBaseAddress(layers[L].wo->ioOut);
+                for (int ci = 0; ci < cfg.dim; ci++) x[ci] += (float)wo_out[ci * DECODE_S];
+                IOSurfaceUnlock(layers[L].wo->ioOut, kIOSurfaceLockReadOnly, NULL);
                 // ANE FFN
+                rmsnorm_f32_to_f16(cfg.dim, x_f16, x, layers[L].rms_ffn);
                 IOSurfaceLock(layers[L].ffn->ioIn, 0, NULL);
-                _Float16 *ffn_inp = (_Float16*)IOSurfaceGetBaseAddress(layers[L].ffn->ioIn);
-                memset(ffn_inp, 0, cfg.dim * DECODE_S * sizeof(_Float16));
-                for (int ci = 0; ci < cfg.dim; ci++)
-                    ffn_inp[ci * DECODE_S] = x_f16[ci];
+                _Float16 *fi = (_Float16*)IOSurfaceGetBaseAddress(layers[L].ffn->ioIn);
+                memset(fi, 0, cfg.dim * DECODE_S * sizeof(_Float16));
+                for (int ci = 0; ci < cfg.dim; ci++) fi[ci * DECODE_S] = x_f16[ci];
                 IOSurfaceUnlock(layers[L].ffn->ioIn, 0, NULL);
-
                 ane_eval(layers[L].ffn);
-
                 IOSurfaceLock(layers[L].ffn->ioOut, kIOSurfaceLockReadOnly, NULL);
-                const _Float16 *ffn_outp = (const _Float16*)IOSurfaceGetBaseAddress(layers[L].ffn->ioOut);
-                for (int ci = 0; ci < cfg.dim; ci++)
-                    x[ci] += (float)ffn_outp[ci * DECODE_S];
+                const _Float16 *fo = (const _Float16*)IOSurfaceGetBaseAddress(layers[L].ffn->ioOut);
+                for (int ci = 0; ci < cfg.dim; ci++) x[ci] += (float)fo[ci * DECODE_S];
                 IOSurfaceUnlock(layers[L].ffn->ioOut, kIOSurfaceLockReadOnly, NULL);
             }
-            tb = mach_absolute_time();
-
-            uint64_t t4 = mach_absolute_time();
-            t_ane += tb_ms(t1 - t0) + tb_ms(t4 - t3);  // QKV + FFN ANE
-            t_attn += tb_ms(t3 - t2);  // attention + Wo ANE
-            t_other += tb_ms(t2 - t1);  // QKV I/O
+            uint64_t t3 = mach_absolute_time();
+            t_ane += tb_ms(t1 - t0) + tb_ms(t3 - t2);  // projections (Metal or ANE)
+            t_attn += tb_ms(t2 - t1);  // CPU attention
         }
 
         // Advance KV cache position
@@ -934,10 +905,10 @@ int main(int argc, char **argv) {
     uint64_t t_end = mach_absolute_time();
     double elapsed_ms = tb_ms(t_end - t_start);
     printf("\n\n--- %d tokens in %.1f ms (%.1f ms/tok, %.1f tok/s) ---\n"
-           "    ane=%.1fms attn=%.1fms cls=%.1fms io=%.1fms\n",
+           "    proj=%.1fms attn=%.1fms cls=%.1fms\n",
            generated, elapsed_ms, elapsed_ms / (generated ? generated : 1),
            generated * 1000.0 / elapsed_ms,
-           t_ane, t_attn, t_cls, t_other);
+           t_ane, t_attn, t_cls);
 
     // Cleanup
     kv_cache_free(kv);
@@ -957,7 +928,7 @@ int main(int argc, char **argv) {
     }
     free(layers);
     if (wo_weights) free(wo_weights);
-    metal_ffn_free(metal_ffn);
+    metal_free(metal);
     tokenizer_free(tokenizer);
     bpe_tokenizer_free(bpe_tokenizer);
 
