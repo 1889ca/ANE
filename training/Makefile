@@ -4,7 +4,7 @@ FRAMEWORKS = -framework Foundation -framework CoreML -framework IOSurface
 LDFLAGS = $(FRAMEWORKS) -ldl
 
 HEADERS_LARGE = stories_config.h stories_io.h stories_mil.h stories_cpu_ops.h
-HEADERS_INFER = infer_config.h kv_cache.h infer_mil.h bonsai_lora.h stories_io.h stories_config.h
+HEADERS_INFER = infer_config.h kv_cache.h infer_mil.h bonsai_lora.h stories_io.h stories_config.h infer_tokenizer.h
 
 train: train.m ane_runtime.h ane_mil_gen.h model.h forward.h backward.h
 	$(CC) $(CFLAGS) -o $@ train.m $(LDFLAGS)

@@ -17,39 +17,21 @@
     "        tensor<int32, [2]> dl = const()[name=string(\"dl\"), val=tensor<int32, [2]>([1,1])];\n" \
     "        int32 gr = const()[name=string(\"gr\"), val=int32(1)];\n"
 
-// ========== QKV Projection ==========
-// Input:  [1, dim, 1, S] — x
+// ========== QKV Projection (no RMSNorm — caller does it in fp32) ==========
+// Input:  [1, dim, 1, S] — pre-normalized x (already RMSNorm'd)
 // Output: [1, dim + 2*kv_dim, 1, S] — concat(Q, K, V)
-// Weights: rms_att[dim], Wq[dim,dim], Wk[kv_dim,dim], Wv[kv_dim,dim]
-// Blob layout: rms1.bin, wq.bin, wk.bin, wv.bin
+// Weights: Wq[dim,dim], Wk[kv_dim,dim], Wv[kv_dim,dim]
 static NSString *gen_infer_qkv(const InferConfig *c, int S) {
-    float invd = 1.0f / (float)c->dim;
     NSMutableString *m = [NSMutableString string];
     [m appendString:INFER_MIL_HDR];
     [m appendFormat:@"    func main<ios18>(tensor<fp16, [1, %d, 1, %d]> x) {\n", c->dim, S];
-    // RMSNorm
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> sq = mul(x=x,y=x)[name=string(\"sq\")];\n", c->dim, S];
-    [m appendFormat:@"        tensor<int32, [1]> rax = const()[name=string(\"rax\"), val=tensor<int32, [1]>([1])];\n"];
-    [m appendFormat:@"        bool kd = const()[name=string(\"kd\"), val=bool(true)];\n"];
-    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> ss = reduce_sum(x=sq,axes=rax,keep_dims=kd)[name=string(\"ss\")];\n", S];
-    [m appendFormat:@"        fp16 invd = const()[name=string(\"invd\"), val=fp16(%f)];\n", invd];
-    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> ss2 = mul(x=ss,y=invd)[name=string(\"ss2\")];\n", S];
-    [m appendFormat:@"        fp16 eps = const()[name=string(\"eps\"), val=fp16(0.00001)];\n"];
-    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> ss3 = add(x=ss2,y=eps)[name=string(\"ss3\")];\n", S];
-    [m appendFormat:@"        fp16 nhalf = const()[name=string(\"nhalf\"), val=fp16(-0.5)];\n"];
-    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> rrms = pow(x=ss3,y=nhalf)[name=string(\"rrms\")];\n", S];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> xr = mul(x=x,y=rrms)[name=string(\"xr\")];\n", c->dim, S];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,1]> rw = const()[name=string(\"rw\"), val=tensor<fp16, [1,%d,1,1]>(BLOBFILE(path=string(\"@model_path/weights/rms1.bin\"), offset=uint64(64)))];\n", c->dim, c->dim];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> xn = mul(x=xr,y=rw)[name=string(\"xn\")];\n", c->dim, S];
-    // QKV convolutions
     [m appendString:@INFER_CONV_CONST];
     [m appendFormat:@"        tensor<fp16, [%d,%d,1,1]> Wq = const()[name=string(\"Wq\"), val=tensor<fp16, [%d,%d,1,1]>(BLOBFILE(path=string(\"@model_path/weights/wq.bin\"), offset=uint64(64)))];\n", c->dim, c->dim, c->dim, c->dim];
     [m appendFormat:@"        tensor<fp16, [%d,%d,1,1]> Wk = const()[name=string(\"Wk\"), val=tensor<fp16, [%d,%d,1,1]>(BLOBFILE(path=string(\"@model_path/weights/wk.bin\"), offset=uint64(64)))];\n", c->kv_dim, c->dim, c->kv_dim, c->dim];
     [m appendFormat:@"        tensor<fp16, [%d,%d,1,1]> Wv = const()[name=string(\"Wv\"), val=tensor<fp16, [%d,%d,1,1]>(BLOBFILE(path=string(\"@model_path/weights/wv.bin\"), offset=uint64(64)))];\n", c->kv_dim, c->dim, c->kv_dim, c->dim];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> qf = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wq,x=xn)[name=string(\"cq\")];\n", c->dim, S];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> kf = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wk,x=xn)[name=string(\"ck\")];\n", c->kv_dim, S];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> vf = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wv,x=xn)[name=string(\"cv\")];\n", c->kv_dim, S];
-    // Concat Q, K, V
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> qf = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wq,x=x)[name=string(\"cq\")];\n", c->dim, S];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> kf = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wk,x=x)[name=string(\"ck\")];\n", c->kv_dim, S];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> vf = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wv,x=x)[name=string(\"cv\")];\n", c->kv_dim, S];
     int out_ch = c->dim + 2 * c->kv_dim;
     [m appendString:@"        int32 cax = const()[name=string(\"cax\"), val=int32(1)];\n"];
     [m appendString:@"        bool cid = const()[name=string(\"cid\"), val=bool(false)];\n"];
@@ -147,41 +129,25 @@ static NSString *gen_infer_attn_prefill(const InferConfig *c, int S) {
 // Then softmax, then scores[1,T] @ V_cache[T,dim] — another BLAS call
 // For T=2048, dim=4096, this is ~2 matmul calls, ~0.1ms each on M-series NEON
 
-// ========== FFN (inference-only, no backward taps) ==========
-// Input:  [1, dim, 1, S]
-// Output: [1, dim, 1, S] — x + W2(silu(W1(xn)) * W3(xn))
-// Weights: rms2[dim], W1[hidden,dim], W3[hidden,dim], W2[dim,hidden]
+// ========== FFN (no RMSNorm, no residual — caller handles both in fp32) ==========
+// Input:  [1, dim, 1, S] — pre-normalized x
+// Output: [1, dim, 1, S] — W2(silu(W1(x)) * W3(x))  (delta only)
+// Weights: W1[hidden,dim], W3[hidden,dim], W2[dim,hidden]
 static NSString *gen_infer_ffn(const InferConfig *c, int S) {
-    float invd = 1.0f / (float)c->dim;
     NSMutableString *m = [NSMutableString string];
     [m appendString:INFER_MIL_HDR];
     [m appendFormat:@"    func main<ios18>(tensor<fp16, [1, %d, 1, %d]> x) {\n", c->dim, S];
-    // RMSNorm
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> sq = mul(x=x,y=x)[name=string(\"sq\")];\n", c->dim, S];
-    [m appendFormat:@"        tensor<int32, [1]> rax = const()[name=string(\"rax\"), val=tensor<int32, [1]>([1])];\n"];
-    [m appendFormat:@"        bool kd = const()[name=string(\"kd\"), val=bool(true)];\n"];
-    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> ss = reduce_sum(x=sq,axes=rax,keep_dims=kd)[name=string(\"ss\")];\n", S];
-    [m appendFormat:@"        fp16 invd = const()[name=string(\"invd\"), val=fp16(%f)];\n", invd];
-    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> ss2 = mul(x=ss,y=invd)[name=string(\"ss2\")];\n", S];
-    [m appendFormat:@"        fp16 eps = const()[name=string(\"eps\"), val=fp16(0.00001)];\n"];
-    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> ss3 = add(x=ss2,y=eps)[name=string(\"ss3\")];\n", S];
-    [m appendFormat:@"        fp16 nhalf = const()[name=string(\"nhalf\"), val=fp16(-0.5)];\n"];
-    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> rrms = pow(x=ss3,y=nhalf)[name=string(\"rrms\")];\n", S];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> xr = mul(x=x,y=rrms)[name=string(\"xr\")];\n", c->dim, S];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,1]> rw = const()[name=string(\"rw\"), val=tensor<fp16, [1,%d,1,1]>(BLOBFILE(path=string(\"@model_path/weights/rms2.bin\"), offset=uint64(64)))];\n", c->dim, c->dim];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> xn = mul(x=xr,y=rw)[name=string(\"xn\")];\n", c->dim, S];
-    // FFN: W1, W3 (gate), silu, W2
     [m appendString:@INFER_CONV_CONST];
     [m appendFormat:@"        tensor<fp16, [%d,%d,1,1]> W1 = const()[name=string(\"W1\"), val=tensor<fp16, [%d,%d,1,1]>(BLOBFILE(path=string(\"@model_path/weights/w1.bin\"), offset=uint64(64)))];\n", c->hidden_dim, c->dim, c->hidden_dim, c->dim];
     [m appendFormat:@"        tensor<fp16, [%d,%d,1,1]> W3 = const()[name=string(\"W3\"), val=tensor<fp16, [%d,%d,1,1]>(BLOBFILE(path=string(\"@model_path/weights/w3.bin\"), offset=uint64(64)))];\n", c->hidden_dim, c->dim, c->hidden_dim, c->dim];
     [m appendFormat:@"        tensor<fp16, [%d,%d,1,1]> W2 = const()[name=string(\"W2\"), val=tensor<fp16, [%d,%d,1,1]>(BLOBFILE(path=string(\"@model_path/weights/w2.bin\"), offset=uint64(64)))];\n", c->dim, c->hidden_dim, c->dim, c->hidden_dim];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> h1 = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=W1,x=xn)[name=string(\"c1\")];\n", c->hidden_dim, S];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> h3 = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=W3,x=xn)[name=string(\"c3\")];\n", c->hidden_dim, S];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> h1 = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=W1,x=x)[name=string(\"c1\")];\n", c->hidden_dim, S];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> h3 = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=W3,x=x)[name=string(\"c3\")];\n", c->hidden_dim, S];
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> sig = sigmoid(x=h1)[name=string(\"sg\")];\n", c->hidden_dim, S];
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> silu = mul(x=h1,y=sig)[name=string(\"si\")];\n", c->hidden_dim, S];
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> gate = mul(x=silu,y=h3)[name=string(\"gt\")];\n", c->hidden_dim, S];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> y = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=W2,x=gate)[name=string(\"c2\")];\n", c->dim, S];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> out = add(x=x,y=y)[name=string(\"res\")];\n", c->dim, S];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> out = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=W2,x=gate)[name=string(\"c2\")];\n", c->dim, S];
+    // No residual add — caller does it in fp32 to prevent overflow
     [m appendString:@"    } -> (out);\n}\n"];
     return m;
 }
@@ -305,12 +271,12 @@ static void cpu_attn_decode(const InferConfig *c, const _Float16 *q_rope,
         }
     }
 
-    // Wo projection: out = Wo @ attn (Wo is [dim, dim] row-major)
+    // Wo projection: out = Wo @ attn (no residual — caller adds in fp32)
     int D = c->dim;
     for (int i = 0; i < D; i++) {
         float val = 0;
         for (int j = 0; j < D; j++)
             val += (float)wo[i * D + j] * scratch->attn_f32[j];
-        out[i] = (_Float16)((float)x_residual[i] + val);
+        out[i] = (_Float16)val;
     }
 }

@@ -28,6 +28,7 @@
 #include "kv_cache.h"
 #include "infer_mil.h"
 #include "bonsai_lora.h"
+#include "infer_tokenizer.h"
 
 // ========== QK Norm (Qwen3) ==========
 // Per-head RMSNorm on Q[dim] and K[kv_dim] with learned weights[head_dim]
@@ -118,13 +119,23 @@ static void rope_prefill(const InferConfig *c, _Float16 *q, _Float16 *k, int S) 
     }
 }
 
-// ========== CPU RMSNorm for single vector ==========
+// ========== CPU RMSNorm ==========
+// fp16 in/out version (for final norm / small models)
 static void rmsnorm_f16(const InferConfig *c, _Float16 *out, const _Float16 *x, const _Float16 *w) {
     float ss = 0;
     for (int i = 0; i < c->dim; i++) ss += (float)x[i] * (float)x[i];
     ss = 1.0f / sqrtf(ss / c->dim + 1e-5f);
     for (int i = 0; i < c->dim; i++)
         out[i] = (_Float16)((float)x[i] * ss * (float)w[i]);
+}
+
+// fp32 input → fp16 output (for ANE kernel input prep)
+static void rmsnorm_f32_to_f16(int dim, _Float16 *out, const float *x, const _Float16 *w) {
+    float ss = 0;
+    for (int i = 0; i < dim; i++) ss += x[i] * x[i];
+    ss = 1.0f / sqrtf(ss / dim + 1e-6f);
+    for (int i = 0; i < dim; i++)
+        out[i] = (_Float16)(x[i] * ss * (float)w[i]);
 }
 
 // ========== CPU classifier ==========
@@ -284,11 +295,13 @@ static void tokenizer_free(Tokenizer *t) {
 
 // ========== Per-layer ANE kernels ==========
 typedef struct {
-    Kern *qkv;        // QKV projection (ANE)
-    Kern *ffn;        // FFN (ANE)
-    _Float16 *wo;     // Wo weights for CPU attention (persisted)
-    _Float16 *q_norm; // QK norm weights [head_dim] (NULL if no QK norm)
-    _Float16 *k_norm; // QK norm weights [head_dim]
+    Kern *qkv;         // QKV projection (ANE, no RMSNorm)
+    Kern *ffn;         // FFN (ANE, no RMSNorm, no residual)
+    _Float16 *wo;      // Wo weights for CPU attention
+    _Float16 *rms_att; // RMSNorm weights [dim] for attention (CPU)
+    _Float16 *rms_ffn; // RMSNorm weights [dim] for FFN (CPU)
+    _Float16 *q_norm;  // QK norm weights [head_dim]
+    _Float16 *k_norm;  // QK norm weights [head_dim]
 } InferLayerKernels;
 
 // ========== GGUF tensor name helpers for Qwen3 ==========
@@ -467,30 +480,33 @@ int main(int argc, char **argv) {
             printf("  Layer %d/%d\r", L+1, cfg.n_layers); fflush(stdout);
 
             // QKV kernel
+            // QKV kernel (no RMSNorm — done on CPU)
             NSString *qkv_mil = gen_infer_qkv(&cfg, DECODE_S);
             NSDictionary *qkv_w = @{
-                @"@model_path/weights/rms1.bin": @{@"offset":@0, @"data":build_blob_fp16(rms_att[L], cfg.dim)},
-                @"@model_path/weights/wq.bin":   @{@"offset":@0, @"data":bonsai_build_blob_fp16(wq[L], cfg.dim, cfg.dim)},
-                @"@model_path/weights/wk.bin":   @{@"offset":@0, @"data":bonsai_build_blob_fp16(wk[L], cfg.kv_dim, cfg.dim)},
-                @"@model_path/weights/wv.bin":   @{@"offset":@0, @"data":bonsai_build_blob_fp16(wv[L], cfg.kv_dim, cfg.dim)},
+                @"@model_path/weights/wq.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(wq[L], cfg.dim, cfg.dim)},
+                @"@model_path/weights/wk.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(wk[L], cfg.kv_dim, cfg.dim)},
+                @"@model_path/weights/wv.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(wv[L], cfg.kv_dim, cfg.dim)},
             };
-            int qkv_in = cfg.dim * DECODE_S * 2;  // [dim, DECODE_S] fp16
+            int qkv_in = cfg.dim * DECODE_S * 2;
             int qkv_out = (cfg.dim + 2 * cfg.kv_dim) * DECODE_S * 2;
             layers[L].qkv = compile_kern_mil_w(qkv_mil, qkv_w, qkv_in, qkv_out);
             if (!layers[L].qkv) { fprintf(stderr, "FATAL: QKV compile failed L=%d\n", L); return 1; }
 
-            // FFN kernel
+            // FFN kernel (no RMSNorm, no residual — done on CPU)
             NSString *ffn_mil = gen_infer_ffn(&cfg, DECODE_S);
             NSDictionary *ffn_w = @{
-                @"@model_path/weights/rms2.bin": @{@"offset":@0, @"data":build_blob_fp16(rms_ffn[L], cfg.dim)},
-                @"@model_path/weights/w1.bin":   @{@"offset":@0, @"data":bonsai_build_blob_fp16(w1[L], cfg.hidden_dim, cfg.dim)},
-                @"@model_path/weights/w3.bin":   @{@"offset":@0, @"data":bonsai_build_blob_fp16(w3[L], cfg.hidden_dim, cfg.dim)},
-                @"@model_path/weights/w2.bin":   @{@"offset":@0, @"data":bonsai_build_blob_fp16(w2[L], cfg.dim, cfg.hidden_dim)},
+                @"@model_path/weights/w1.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(w1[L], cfg.hidden_dim, cfg.dim)},
+                @"@model_path/weights/w3.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(w3[L], cfg.hidden_dim, cfg.dim)},
+                @"@model_path/weights/w2.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(w2[L], cfg.dim, cfg.hidden_dim)},
             };
             int ffn_in = cfg.dim * DECODE_S * 2;
             int ffn_out = cfg.dim * DECODE_S * 2;
             layers[L].ffn = compile_kern_mil_w(ffn_mil, ffn_w, ffn_in, ffn_out);
             if (!layers[L].ffn) { fprintf(stderr, "FATAL: FFN compile failed L=%d\n", L); return 1; }
+
+            // Store RMSNorm weights for CPU
+            layers[L].rms_att = rms_att[L]; rms_att[L] = NULL;
+            layers[L].rms_ffn = rms_ffn[L]; rms_ffn[L] = NULL;
 
             layers[L].wo = wo_weights[L];
 
@@ -604,25 +620,27 @@ int main(int argc, char **argv) {
                 }
             }
 
-            // Compile QKV kernel (S=1 decode)
+            // QKV kernel (no RMSNorm — done on CPU in fp32)
             NSString *qkv_mil = gen_infer_qkv(&cfg, DECODE_S);
             NSDictionary *qkv_w = @{
-                @"@model_path/weights/rms1.bin": @{@"offset":@0, @"data":build_blob_fp16(rms1, cfg.dim)},
-                @"@model_path/weights/wq.bin":   @{@"offset":@0, @"data":bonsai_build_blob_fp16(wq_f16, cfg.dim, cfg.dim)},
-                @"@model_path/weights/wk.bin":   @{@"offset":@0, @"data":bonsai_build_blob_fp16(wk_f16, cfg.kv_dim, cfg.dim)},
-                @"@model_path/weights/wv.bin":   @{@"offset":@0, @"data":bonsai_build_blob_fp16(wv_f16, cfg.kv_dim, cfg.dim)},
+                @"@model_path/weights/wq.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(wq_f16, cfg.dim, cfg.dim)},
+                @"@model_path/weights/wk.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(wk_f16, cfg.kv_dim, cfg.dim)},
+                @"@model_path/weights/wv.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(wv_f16, cfg.kv_dim, cfg.dim)},
             };
             layers[L].qkv = compile_kern_mil_w(qkv_mil, qkv_w, cfg.dim*DECODE_S*2, (cfg.dim+2*cfg.kv_dim)*DECODE_S*2);
 
-            // Compile FFN kernel (S=1 decode)
+            // FFN kernel (no RMSNorm, no residual)
             NSString *ffn_mil = gen_infer_ffn(&cfg, DECODE_S);
             NSDictionary *ffn_w = @{
-                @"@model_path/weights/rms2.bin": @{@"offset":@0, @"data":build_blob_fp16(rms2, cfg.dim)},
-                @"@model_path/weights/w1.bin":   @{@"offset":@0, @"data":bonsai_build_blob_fp16(w1_f16, cfg.hidden_dim, cfg.dim)},
-                @"@model_path/weights/w3.bin":   @{@"offset":@0, @"data":bonsai_build_blob_fp16(w3_f16, cfg.hidden_dim, cfg.dim)},
-                @"@model_path/weights/w2.bin":   @{@"offset":@0, @"data":bonsai_build_blob_fp16(w2_f16, cfg.dim, cfg.hidden_dim)},
+                @"@model_path/weights/w1.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(w1_f16, cfg.hidden_dim, cfg.dim)},
+                @"@model_path/weights/w3.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(w3_f16, cfg.hidden_dim, cfg.dim)},
+                @"@model_path/weights/w2.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(w2_f16, cfg.dim, cfg.hidden_dim)},
             };
             layers[L].ffn = compile_kern_mil_w(ffn_mil, ffn_w, cfg.dim*DECODE_S*2, cfg.dim*DECODE_S*2);
+
+            // Store RMS norm weights for CPU
+            layers[L].rms_att = rms1; rms1 = NULL;
+            layers[L].rms_ffn = rms2; rms2 = NULL;
 
             // Keep Wo for CPU attention, QK norm weights for CPU norm
             layers[L].wo = wo_f16;
@@ -642,24 +660,23 @@ int main(int argc, char **argv) {
     }
 
     // ====== Tokenization ======
-    const char *tokenizer_path = NULL;
-    Tokenizer *tokenizer = NULL;
+    Tokenizer *tokenizer = NULL;        // llama2.c tokenizer (Stories)
+    BPETokenizer *bpe_tokenizer = NULL; // GGUF BPE tokenizer (Bonsai/Qwen3)
 
     if (use_stories) {
-        // Try to find tokenizer
         const char *tok_paths[] = {
             "/Users/mcm/Development/_ditch/assets/models/tokenizer.bin",
-            "../../assets/models/tokenizer.bin",
-            "tokenizer.bin",
-            NULL
+            "../../assets/models/tokenizer.bin", "tokenizer.bin", NULL
         };
         for (int i = 0; tok_paths[i]; i++) {
-            if (access(tok_paths[i], R_OK) == 0) { tokenizer_path = tok_paths[i]; break; }
+            if (access(tok_paths[i], R_OK) == 0) {
+                tokenizer = tokenizer_load(tok_paths[i], cfg.vocab_size);
+                if (tokenizer) printf("Tokenizer: %d tokens from %s\n", tokenizer->vocab_size, tok_paths[i]);
+                break;
+            }
         }
-        if (tokenizer_path) {
-            tokenizer = tokenizer_load(tokenizer_path, cfg.vocab_size);
-            if (tokenizer) printf("Tokenizer: %d tokens from %s\n", tokenizer->vocab_size, tokenizer_path);
-        }
+    } else if (model_path) {
+        bpe_tokenizer = bpe_tokenizer_from_gguf(model_path);
     }
 
     // ====== Generation loop ======
@@ -672,24 +689,27 @@ int main(int argc, char **argv) {
     if (use_stories && tokenizer) {
         tokens[n_tokens++] = 1;  // BOS
         n_tokens += tokenizer_encode(tokenizer, prompt, tokens + 1, cfg.max_seq - 1);
-        printf("[%d prompt tokens: BOS", n_tokens);
-        for (int i = 1; i < n_tokens && i < 8; i++) printf(" %d", tokens[i]);
-        if (n_tokens > 8) printf(" ...");
-        printf("]\n");
+    } else if (bpe_tokenizer) {
+        n_tokens = bpe_encode(bpe_tokenizer, prompt, tokens, cfg.max_seq);
     } else {
-        // Byte-level fallback for Qwen3 (placeholder until proper tokenizer)
         for (int i = 0; prompt[i] && n_tokens < cfg.max_seq; i++)
             tokens[n_tokens++] = (unsigned char)prompt[i];
     }
+    printf("[%d prompt tokens:", n_tokens);
+    for (int i = 0; i < n_tokens && i < 8; i++) printf(" %d", tokens[i]);
+    if (n_tokens > 8) printf(" ...");
+    printf("]\n");
 
     // Allocate inference state
     KVCache *kv = kv_cache_alloc(&cfg);
     AttnDecodeScratch *attn_scratch = attn_decode_scratch_alloc(&cfg);
-    _Float16 *x = (_Float16 *)calloc(cfg.dim, sizeof(_Float16));        // current hidden state
-    _Float16 *q_buf = (_Float16 *)calloc(cfg.dim, sizeof(_Float16));     // Q after RoPE
-    _Float16 *k_buf = (_Float16 *)calloc(cfg.kv_dim, sizeof(_Float16));  // K after RoPE
-    _Float16 *v_buf = (_Float16 *)calloc(cfg.kv_dim, sizeof(_Float16));  // V
-    _Float16 *x_norm = (_Float16 *)calloc(cfg.dim, sizeof(_Float16));    // after final rmsnorm
+    float *x = (float *)calloc(cfg.dim, sizeof(float));                  // fp32 residual stream
+    _Float16 *x_f16 = (_Float16 *)calloc(cfg.dim, sizeof(_Float16));    // fp16 for ANE I/O
+    _Float16 *delta_f16 = (_Float16 *)calloc(cfg.dim, sizeof(_Float16));// fp16 delta from ANE
+    _Float16 *q_buf = (_Float16 *)calloc(cfg.dim, sizeof(_Float16));
+    _Float16 *k_buf = (_Float16 *)calloc(cfg.kv_dim, sizeof(_Float16));
+    _Float16 *v_buf = (_Float16 *)calloc(cfg.kv_dim, sizeof(_Float16));
+    _Float16 *x_norm = (_Float16 *)calloc(cfg.dim, sizeof(_Float16));
     float *logits = (float *)malloc(cfg.vocab_size * sizeof(float));
 
     uint64_t t_start = mach_absolute_time();
@@ -699,19 +719,21 @@ int main(int argc, char **argv) {
     for (int pos = 0; pos < n_tokens + max_tokens - 1; pos++) {
         int tok = (pos < n_tokens) ? tokens[pos] : tokens[n_tokens - 1 + generated];
 
-        // Embedding lookup: x = embed[tok] (row-major [vocab, dim])
-        memcpy(x, embed + tok * cfg.dim, cfg.dim * sizeof(_Float16));
+        // Embedding lookup: x = embed[tok] (fp16 → fp32)
+        for (int ci = 0; ci < cfg.dim; ci++)
+            x[ci] = (float)embed[tok * cfg.dim + ci];
 
 
         // Process through all layers
         for (int L = 0; L < cfg.n_layers; L++) {
-            // QKV projection via ANE — channel-first [dim, DECODE_S]
-            // Data at position 0, rest zero-padded
+            // CPU RMSNorm (fp32→fp16) then QKV projection on ANE
+            rmsnorm_f32_to_f16(cfg.dim, x_f16, x, layers[L].rms_att);
+
             IOSurfaceLock(layers[L].qkv->ioIn, 0, NULL);
             _Float16 *qkv_inp = (_Float16*)IOSurfaceGetBaseAddress(layers[L].qkv->ioIn);
             memset(qkv_inp, 0, cfg.dim * DECODE_S * sizeof(_Float16));
             for (int ci = 0; ci < cfg.dim; ci++)
-                qkv_inp[ci * DECODE_S] = x[ci];
+                qkv_inp[ci * DECODE_S] = x_f16[ci];
             IOSurfaceUnlock(layers[L].qkv->ioIn, 0, NULL);
 
             ane_eval(layers[L].qkv);
@@ -740,17 +762,22 @@ int main(int argc, char **argv) {
             // Append K, V to cache
             kv_cache_append1(kv, L, k_buf, v_buf);
 
-            // CPU attention decode
-            int T = pos + 1;  // number of valid positions in cache
+            // CPU attention decode — outputs delta (no residual), add in fp32
+            int T = pos + 1;
             cpu_attn_decode(&cfg, q_buf, kv->layers[L].k, kv->layers[L].v,
-                           layers[L].wo, x, x, T, attn_scratch);
+                           layers[L].wo, NULL, delta_f16, T, attn_scratch);
+            for (int ci = 0; ci < cfg.dim; ci++)
+                x[ci] += (float)delta_f16[ci];
 
-            // FFN via ANE — channel-first [dim, DECODE_S]
+
+            // CPU RMSNorm (fp32→fp16) then FFN on ANE
+            rmsnorm_f32_to_f16(cfg.dim, x_f16, x, layers[L].rms_ffn);
+
             IOSurfaceLock(layers[L].ffn->ioIn, 0, NULL);
             _Float16 *ffn_inp = (_Float16*)IOSurfaceGetBaseAddress(layers[L].ffn->ioIn);
             memset(ffn_inp, 0, cfg.dim * DECODE_S * sizeof(_Float16));
             for (int ci = 0; ci < cfg.dim; ci++)
-                ffn_inp[ci * DECODE_S] = x[ci];
+                ffn_inp[ci * DECODE_S] = x_f16[ci];
             IOSurfaceUnlock(layers[L].ffn->ioIn, 0, NULL);
 
             ane_eval(layers[L].ffn);
@@ -758,8 +785,9 @@ int main(int argc, char **argv) {
             IOSurfaceLock(layers[L].ffn->ioOut, kIOSurfaceLockReadOnly, NULL);
             const _Float16 *ffn_outp = (const _Float16*)IOSurfaceGetBaseAddress(layers[L].ffn->ioOut);
             for (int ci = 0; ci < cfg.dim; ci++)
-                x[ci] = ffn_outp[ci * DECODE_S];
+                x[ci] += (float)ffn_outp[ci * DECODE_S];  // residual add in fp32
             IOSurfaceUnlock(layers[L].ffn->ioOut, kIOSurfaceLockReadOnly, NULL);
+
         }
 
         // Advance KV cache position
@@ -768,8 +796,8 @@ int main(int argc, char **argv) {
 
         // Only sample after processing prompt
         if (pos >= n_tokens - 1) {
-            // Final RMSNorm
-            rmsnorm_f16(&cfg, x_norm, x, rms_final_w);
+            // Final RMSNorm in fp32 → fp16
+            rmsnorm_f32_to_f16(cfg.dim, x_norm, x, rms_final_w);
 
             // Classifier: embed @ x_norm → logits
             classifier_f16(&cfg, logits, output_w, x_norm);
@@ -785,20 +813,26 @@ int main(int argc, char **argv) {
             tokens[n_tokens - 1 + generated] = next_tok;
 
             // Print token
-            if (next_tok == 2 || next_tok == 0 || next_tok == 151643) break;  // EOS/PAD/Qwen3 EOS
-            if (tokenizer) {
-                const char *piece = tokenizer_decode(tokenizer, next_tok);
-                // Handle hex-encoded bytes like <0x0A>
-                if (piece[0] == '<' && piece[1] == '0' && piece[2] == 'x') {
-                    int byte_val = (int)strtol(piece + 3, NULL, 16);
-                    printf("%c", (char)byte_val);
+            // Check EOS
+            if (next_tok == 0) break;  // PAD
+            if (next_tok == 2) break;  // llama2 EOS
+            if (bpe_tokenizer && next_tok == bpe_tokenizer->eos_id) break;
+
+            // Decode and print
+            const char *piece = NULL;
+            if (bpe_tokenizer)
+                piece = bpe_decode_token(bpe_tokenizer, next_tok);
+            else if (tokenizer)
+                piece = tokenizer_decode(tokenizer, next_tok);
+
+            if (piece && piece[0]) {
+                if (piece[0] == '<' && piece[1] == '0' && piece[2] == 'x' && strlen(piece) == 6) {
+                    printf("%c", (char)strtol(piece + 3, NULL, 16));
                 } else {
                     printf("%s", piece);
                 }
             } else if (next_tok > 0 && next_tok < 256) {
                 printf("%c", (char)next_tok);
-            } else {
-                printf("[%d]", next_tok);
             }
             fflush(stdout);
 
@@ -816,7 +850,7 @@ int main(int argc, char **argv) {
     // Cleanup
     kv_cache_free(kv);
     attn_decode_scratch_free(attn_scratch);
-    free(x); free(q_buf); free(k_buf); free(v_buf); free(x_norm);
+    free(x); free(x_f16); free(delta_f16); free(q_buf); free(k_buf); free(v_buf); free(x_norm);
     free(logits); free(tokens); free(embed);
     if (output_w != embed) free(output_w);
     free(rms_final_w);
@@ -824,11 +858,14 @@ int main(int argc, char **argv) {
         free_kern(layers[L].qkv);
         free_kern(layers[L].ffn);
         free(wo_weights[L]);
+        free(layers[L].rms_att);
+        free(layers[L].rms_ffn);
         free(layers[L].q_norm);
         free(layers[L].k_norm);
     }
     free(layers); free(wo_weights);
     tokenizer_free(tokenizer);
+    bpe_tokenizer_free(bpe_tokenizer);
 
     } // @autoreleasepool
     return 0;
