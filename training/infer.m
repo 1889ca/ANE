@@ -310,8 +310,8 @@ static void tokenizer_free(Tokenizer *t) {
 // ========== Per-layer ANE kernels ==========
 typedef struct {
     Kern *qkv;         // QKV projection (ANE, no RMSNorm)
+    Kern *wo;          // Wo projection (ANE)
     Kern *ffn;         // FFN (ANE, no RMSNorm, no residual)
-    _Float16 *wo;      // Wo weights for CPU attention
     _Float16 *rms_att; // RMSNorm weights [dim] for attention (CPU)
     _Float16 *rms_ffn; // RMSNorm weights [dim] for FFN (CPU)
     _Float16 *q_norm;  // QK norm weights [head_dim]
@@ -496,39 +496,40 @@ int main(int argc, char **argv) {
         for (int L = 0; L < cfg.n_layers; L++) {
             printf("  Layer %d/%d\r", L+1, cfg.n_layers); fflush(stdout);
 
-            // QKV kernel
             // QKV kernel (no RMSNorm — done on CPU)
-            NSString *qkv_mil = gen_infer_qkv(&cfg, DECODE_S);
+            int io_s = DECODE_S;
+            NSString *qkv_mil = gen_infer_qkv(&cfg, io_s);
             NSDictionary *qkv_w = @{
                 @"@model_path/weights/wq.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(wq[L], cfg.dim, cfg.dim)},
                 @"@model_path/weights/wk.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(wk[L], cfg.kv_dim, cfg.dim)},
                 @"@model_path/weights/wv.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(wv[L], cfg.kv_dim, cfg.dim)},
             };
-            int qkv_in = cfg.dim * DECODE_S * 2;
-            int qkv_out = (cfg.dim + 2 * cfg.kv_dim) * DECODE_S * 2;
-            layers[L].qkv = compile_kern_mil_w(qkv_mil, qkv_w, qkv_in, qkv_out);
-            if (!layers[L].qkv) { fprintf(stderr, "FATAL: QKV compile failed L=%d\n", L); return 1; }
+            layers[L].qkv = compile_kern_mil_w(qkv_mil, qkv_w,
+                cfg.dim * io_s * 2, (cfg.dim + 2 * cfg.kv_dim) * io_s * 2);
 
-            // FFN kernel (no RMSNorm, no residual — done on CPU)
-            NSString *ffn_mil = gen_infer_ffn(&cfg, DECODE_S);
+            // Wo projection kernel
+            NSString *wo_mil = gen_infer_wo(&cfg, io_s);
+            NSDictionary *wo_w = @{
+                @"@model_path/weights/wo.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(wo_weights[L], cfg.dim, cfg.dim)},
+            };
+            layers[L].wo = compile_kern_mil_w(wo_mil, wo_w, cfg.dim * io_s * 2, cfg.dim * io_s * 2);
+
+            // FFN kernel (no RMSNorm, no residual)
+            NSString *ffn_mil = gen_infer_ffn(&cfg, io_s);
             NSDictionary *ffn_w = @{
                 @"@model_path/weights/w1.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(w1[L], cfg.hidden_dim, cfg.dim)},
                 @"@model_path/weights/w3.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(w3[L], cfg.hidden_dim, cfg.dim)},
                 @"@model_path/weights/w2.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(w2[L], cfg.dim, cfg.hidden_dim)},
             };
-            int ffn_in = cfg.dim * DECODE_S * 2;
-            int ffn_out = cfg.dim * DECODE_S * 2;
-            layers[L].ffn = compile_kern_mil_w(ffn_mil, ffn_w, ffn_in, ffn_out);
-            if (!layers[L].ffn) { fprintf(stderr, "FATAL: FFN compile failed L=%d\n", L); return 1; }
+            layers[L].ffn = compile_kern_mil_w(ffn_mil, ffn_w, cfg.dim * io_s * 2, cfg.dim * io_s * 2);
 
             // Store RMSNorm weights for CPU
             layers[L].rms_att = rms_att[L]; rms_att[L] = NULL;
             layers[L].rms_ffn = rms_ffn[L]; rms_ffn[L] = NULL;
 
-            layers[L].wo = wo_weights[L];
-
-            // Free layer weights no longer needed (baked into kernels)
-            free(rms_att[L]); free(wq[L]); free(wk[L]); free(wv[L]);
+            // Free layer weights baked into kernels
+            free(wo_weights[L]); wo_weights[L] = NULL;
+            free(wq[L]); free(wk[L]); free(wv[L]);
             free(rms_ffn[L]); free(w1[L]); free(w2[L]); free(w3[L]);
         }
         free(rms_att); free(wq); free(wk); free(wv);
@@ -655,37 +656,41 @@ int main(int argc, char **argv) {
             }
 
             // QKV kernel (no RMSNorm — done on CPU in fp32)
-            NSString *qkv_mil = gen_infer_qkv(&cfg, DECODE_S);
+            int io_s = DECODE_S;
+            NSString *qkv_mil = gen_infer_qkv(&cfg, io_s);
             NSDictionary *qkv_w = @{
                 @"@model_path/weights/wq.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(wq_f16, cfg.dim, cfg.dim)},
                 @"@model_path/weights/wk.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(wk_f16, cfg.kv_dim, cfg.dim)},
                 @"@model_path/weights/wv.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(wv_f16, cfg.kv_dim, cfg.dim)},
             };
-            layers[L].qkv = compile_kern_mil_w(qkv_mil, qkv_w, cfg.dim*DECODE_S*2, (cfg.dim+2*cfg.kv_dim)*DECODE_S*2);
+            layers[L].qkv = compile_kern_mil_w(qkv_mil, qkv_w,
+                cfg.dim*io_s*2, (cfg.dim+2*cfg.kv_dim)*io_s*2);
+
+            // Wo projection kernel (ANE)
+            NSString *wo_mil = gen_infer_wo(&cfg, io_s);
+            NSDictionary *wo_w = @{
+                @"@model_path/weights/wo.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(wo_f16, cfg.dim, cfg.dim)},
+            };
+            layers[L].wo = compile_kern_mil_w(wo_mil, wo_w, cfg.dim*io_s*2, cfg.dim*io_s*2);
 
             // FFN kernel (no RMSNorm, no residual)
-            NSString *ffn_mil = gen_infer_ffn(&cfg, DECODE_S);
+            NSString *ffn_mil = gen_infer_ffn(&cfg, io_s);
             NSDictionary *ffn_w = @{
                 @"@model_path/weights/w1.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(w1_f16, cfg.hidden_dim, cfg.dim)},
                 @"@model_path/weights/w3.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(w3_f16, cfg.hidden_dim, cfg.dim)},
                 @"@model_path/weights/w2.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(w2_f16, cfg.dim, cfg.hidden_dim)},
             };
-            layers[L].ffn = compile_kern_mil_w(ffn_mil, ffn_w, cfg.dim*DECODE_S*2, cfg.dim*DECODE_S*2);
+            layers[L].ffn = compile_kern_mil_w(ffn_mil, ffn_w, cfg.dim*io_s*2, cfg.dim*io_s*2);
 
-            // Store RMS norm weights for CPU
+            // Store RMS norm weights for CPU, QK norm weights
             layers[L].rms_att = rms1; rms1 = NULL;
             layers[L].rms_ffn = rms2; rms2 = NULL;
-
-            // Keep Wo for CPU attention, QK norm weights for CPU norm
-            layers[L].wo = wo_f16;
-            wo_weights[L] = wo_f16;
             layers[L].q_norm = qnorm;
             layers[L].k_norm = knorm;
 
             // Free weights baked into kernels
-            free(wq_f16); free(wk_f16); free(wv_f16);
+            free(wq_f16); free(wk_f16); free(wv_f16); free(wo_f16);
             free(w1_f16); free(w2_f16); free(w3_f16);
-            free(rms1); free(rms2);
         }
         printf("  Done (%d kernels compiled)\n", g_compile_count);
 
@@ -802,12 +807,26 @@ int main(int argc, char **argv) {
             kv_cache_append1(kv, L, k_buf, v_buf);
 
             uint64_t t2 = mach_absolute_time();
-            // CPU attention decode — outputs delta (no residual), add in fp32
+            // CPU attention decode → raw attention output [dim]
             int T = pos + 1;
             cpu_attn_decode(&cfg, q_buf, kv->layers[L].k, kv->layers[L].v,
-                           layers[L].wo, NULL, delta_f16, T, attn_scratch);
+                           delta_f16, T, attn_scratch);
+
+            // Wo projection on ANE: attn_out → Wo @ attn_out
+            IOSurfaceLock(layers[L].wo->ioIn, 0, NULL);
+            _Float16 *wo_inp = (_Float16*)IOSurfaceGetBaseAddress(layers[L].wo->ioIn);
+            memset(wo_inp, 0, cfg.dim * DECODE_S * sizeof(_Float16));
             for (int ci = 0; ci < cfg.dim; ci++)
-                x[ci] += (float)delta_f16[ci];
+                wo_inp[ci * DECODE_S] = delta_f16[ci];
+            IOSurfaceUnlock(layers[L].wo->ioIn, 0, NULL);
+
+            ane_eval(layers[L].wo);
+
+            IOSurfaceLock(layers[L].wo->ioOut, kIOSurfaceLockReadOnly, NULL);
+            const _Float16 *wo_outp = (const _Float16*)IOSurfaceGetBaseAddress(layers[L].wo->ioOut);
+            for (int ci = 0; ci < cfg.dim; ci++)
+                x[ci] += (float)wo_outp[ci * DECODE_S];  // residual add in fp32
+            IOSurfaceUnlock(layers[L].wo->ioOut, kIOSurfaceLockReadOnly, NULL);
 
 
             uint64_t t3 = mach_absolute_time();
@@ -830,9 +849,9 @@ int main(int argc, char **argv) {
             IOSurfaceUnlock(layers[L].ffn->ioOut, kIOSurfaceLockReadOnly, NULL);
 
             uint64_t t4 = mach_absolute_time();
-            t_ane += tb_ms(t1 - t0) + tb_ms(t4 - t3);
-            t_attn += tb_ms(t3 - t2);
-            t_other += tb_ms(t2 - t1);
+            t_ane += tb_ms(t1 - t0) + tb_ms(t4 - t3);  // QKV + FFN ANE
+            t_attn += tb_ms(t3 - t2);  // attention + Wo ANE
+            t_other += tb_ms(t2 - t1);  // QKV I/O
         }
 
         // Advance KV cache position
@@ -905,14 +924,15 @@ int main(int argc, char **argv) {
     free(rms_final_w);
     for (int L = 0; L < cfg.n_layers; L++) {
         free_kern(layers[L].qkv);
+        free_kern(layers[L].wo);
         free_kern(layers[L].ffn);
-        free(wo_weights[L]);
         free(layers[L].rms_att);
         free(layers[L].rms_ffn);
         free(layers[L].q_norm);
         free(layers[L].k_norm);
     }
-    free(layers); free(wo_weights);
+    free(layers);
+    if (wo_weights) free(wo_weights);
     tokenizer_free(tokenizer);
     bpe_tokenizer_free(bpe_tokenizer);
 

@@ -129,10 +129,69 @@ static NSString *gen_infer_attn_prefill(const InferConfig *c, int S) {
 // Then softmax, then scores[1,T] @ V_cache[T,dim] — another BLAS call
 // For T=2048, dim=4096, this is ~2 matmul calls, ~0.1ms each on M-series NEON
 
-// ========== FFN (no RMSNorm, no residual — caller handles both in fp32) ==========
-// Input:  [1, dim, 1, S] — pre-normalized x
-// Output: [1, dim, 1, S] — W2(silu(W1(x)) * W3(x))  (delta only)
-// Weights: W1[hidden,dim], W3[hidden,dim], W2[dim,hidden]
+// ========== Fused Wo + FFN kernel ==========
+// Input:  [1, 2*dim, 1, S] — concat(x_residual_norm_fp16, attn_out)
+//   channels [0..dim): x (already fp16, will be used for residual after Wo)
+//   channels [dim..2*dim): attn_out (for Wo projection)
+// Output: [1, dim, 1, S] — Wo@attn + x residual → RMSNorm → FFN delta
+// Weights: Wo[dim,dim], rms_ffn[dim], W1[hidden,dim], W3[hidden,dim], W2[dim,hidden]
+//
+// IMPORTANT: The residual add (x + Wo@attn) happens in fp16 inside this kernel.
+// For 1-bit models this causes overflow in deep layers. The caller must pass
+// x_residual that has been scaled/clamped appropriately, or use the unfused path.
+// For now we keep the unfused path as fallback (gen_infer_ffn_simple).
+static NSString *gen_infer_wo_ffn(const InferConfig *c, int S) {
+    float invd = 1.0f / (float)c->dim;
+    int D = c->dim;
+    NSMutableString *m = [NSMutableString string];
+    [m appendString:INFER_MIL_HDR];
+    [m appendFormat:@"    func main<ios18>(tensor<fp16, [1, %d, 1, %d]> inp) {\n", 2*D, S];
+
+    // Slice x_residual and attn_out from input channels
+    [m appendFormat:@"        tensor<int32, [4]> szd = const()[name=string(\"szd\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", D, S];
+    [m appendString:@"        tensor<int32, [4]> b0 = const()[name=string(\"b0\"), val=tensor<int32, [4]>([0,0,0,0])];\n"];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> xr = slice_by_size(x=inp,begin=b0,size=szd)[name=string(\"sxr\")];\n", D, S];
+    [m appendFormat:@"        tensor<int32, [4]> bd = const()[name=string(\"bd\"), val=tensor<int32, [4]>([0,%d,0,0])];\n", D];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> ao = slice_by_size(x=inp,begin=bd,size=szd)[name=string(\"sao\")];\n", D, S];
+
+    // Wo projection
+    [m appendString:@INFER_CONV_CONST];
+    [m appendFormat:@"        tensor<fp16, [%d,%d,1,1]> Wo = const()[name=string(\"Wo\"), val=tensor<fp16, [%d,%d,1,1]>(BLOBFILE(path=string(\"@model_path/weights/wo.bin\"), offset=uint64(64)))];\n", D, D, D, D];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> wd = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wo,x=ao)[name=string(\"cwo\")];\n", D, S];
+
+    // Residual add: x2 = x_residual + Wo@attn
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> x2 = add(x=xr,y=wd)[name=string(\"res1\")];\n", D, S];
+
+    // RMSNorm on x2
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> sq = mul(x=x2,y=x2)[name=string(\"sq\")];\n", D, S];
+    [m appendFormat:@"        tensor<int32, [1]> rax = const()[name=string(\"rax\"), val=tensor<int32, [1]>([1])];\n"];
+    [m appendFormat:@"        bool kd = const()[name=string(\"kd\"), val=bool(true)];\n"];
+    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> ss = reduce_sum(x=sq,axes=rax,keep_dims=kd)[name=string(\"ss\")];\n", S];
+    [m appendFormat:@"        fp16 invd = const()[name=string(\"invd\"), val=fp16(%f)];\n", invd];
+    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> ss2 = mul(x=ss,y=invd)[name=string(\"ss2\")];\n", S];
+    [m appendFormat:@"        fp16 eps = const()[name=string(\"eps\"), val=fp16(0.00001)];\n"];
+    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> ss3 = add(x=ss2,y=eps)[name=string(\"ss3\")];\n", S];
+    [m appendFormat:@"        fp16 nhalf = const()[name=string(\"nhalf\"), val=fp16(-0.5)];\n"];
+    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> rrms = pow(x=ss3,y=nhalf)[name=string(\"rrms\")];\n", S];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> xn = mul(x=x2,y=rrms)[name=string(\"xn\")];\n", D, S];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,1]> rw = const()[name=string(\"rw\"), val=tensor<fp16, [1,%d,1,1]>(BLOBFILE(path=string(\"@model_path/weights/rms2.bin\"), offset=uint64(64)))];\n", D, D];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> xnw = mul(x=xn,y=rw)[name=string(\"xnw\")];\n", D, S];
+
+    // FFN: W1, W3 (gate), silu, W2
+    [m appendFormat:@"        tensor<fp16, [%d,%d,1,1]> W1 = const()[name=string(\"W1\"), val=tensor<fp16, [%d,%d,1,1]>(BLOBFILE(path=string(\"@model_path/weights/w1.bin\"), offset=uint64(64)))];\n", c->hidden_dim, D, c->hidden_dim, D];
+    [m appendFormat:@"        tensor<fp16, [%d,%d,1,1]> W3 = const()[name=string(\"W3\"), val=tensor<fp16, [%d,%d,1,1]>(BLOBFILE(path=string(\"@model_path/weights/w3.bin\"), offset=uint64(64)))];\n", c->hidden_dim, D, c->hidden_dim, D];
+    [m appendFormat:@"        tensor<fp16, [%d,%d,1,1]> W2 = const()[name=string(\"W2\"), val=tensor<fp16, [%d,%d,1,1]>(BLOBFILE(path=string(\"@model_path/weights/w2.bin\"), offset=uint64(64)))];\n", D, c->hidden_dim, D, c->hidden_dim];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> h1 = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=W1,x=xnw)[name=string(\"c1\")];\n", c->hidden_dim, S];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> h3 = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=W3,x=xnw)[name=string(\"c3\")];\n", c->hidden_dim, S];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> sig = sigmoid(x=h1)[name=string(\"sg\")];\n", c->hidden_dim, S];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> silu = mul(x=h1,y=sig)[name=string(\"si\")];\n", c->hidden_dim, S];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> gate = mul(x=silu,y=h3)[name=string(\"gt\")];\n", c->hidden_dim, S];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> out = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=W2,x=gate)[name=string(\"c2\")];\n", D, S];
+    [m appendString:@"    } -> (out);\n}\n"];
+    return m;
+}
+
+// Simple FFN (no RMSNorm, no residual — for unfused path)
 static NSString *gen_infer_ffn(const InferConfig *c, int S) {
     NSMutableString *m = [NSMutableString string];
     [m appendString:INFER_MIL_HDR];
@@ -147,7 +206,6 @@ static NSString *gen_infer_ffn(const InferConfig *c, int S) {
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> silu = mul(x=h1,y=sig)[name=string(\"si\")];\n", c->hidden_dim, S];
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> gate = mul(x=silu,y=h3)[name=string(\"gt\")];\n", c->hidden_dim, S];
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> out = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=W2,x=gate)[name=string(\"c2\")];\n", c->dim, S];
-    // No residual add — caller does it in fp32 to prevent overflow
     [m appendString:@"    } -> (out);\n}\n"];
     return m;
 }
@@ -218,76 +276,53 @@ static void attn_decode_scratch_free(AttnDecodeScratch *s) {
     free(s);
 }
 
-// CPU decode attention for a single query position
-// q_rope: [dim] fp16 (post-RoPE Q for this position)
-// k_cache, v_cache: [kv_dim, max_seq] fp16 channel-first
-// wo: [dim, dim] fp16 weights
-// x_residual: [dim] fp16
-// out: [dim] fp16 (x2 = x_residual + Wo @ attn)
-// T: number of valid cached positions
+// CPU decode attention — outputs raw attention result (before Wo projection)
+// q_rope: [dim] fp16 post-RoPE, k/v_cache: [kv_dim, max_seq] fp16
+// out: [dim] fp16 attention output (needs Wo projection after)
 static void cpu_attn_decode(const InferConfig *c, const _Float16 *q_rope,
                             const _Float16 *k_cache, const _Float16 *v_cache,
-                            const _Float16 *wo, const _Float16 *x_residual,
                             _Float16 *out, int T, AttnDecodeScratch *scratch) {
-    int nH = c->n_heads, nKVH = c->n_kv_heads, hd = c->head_dim, gqa = c->kv_group;
+    int nH = c->n_heads, hd = c->head_dim, gqa = c->kv_group;
     float scale = 1.0f / sqrtf((float)hd);
 
-    // For each head: scores[t] = sum_d(q[d] * k[d,t]) * scale
-    // Then softmax, then attn[d] = sum_t(scores[t] * v[d,t])
     for (int h = 0; h < nH; h++) {
-        int kv_h = h / gqa;  // GQA: map Q head to KV head
+        int kv_h = h / gqa;
         float *sc = scratch->scores + h * T;
 
-        // Compute attention scores for this head
         float max_score = -1e30f;
         for (int t = 0; t < T; t++) {
             float dot = 0;
             for (int d = 0; d < hd; d++) {
-                int q_idx = h * hd + d;
-                int k_idx = (kv_h * hd + d) * c->max_seq + t;
-                dot += (float)q_rope[q_idx] * (float)k_cache[k_idx];
+                dot += (float)q_rope[h * hd + d] * (float)k_cache[(kv_h * hd + d) * c->max_seq + t];
             }
             sc[t] = dot * scale;
             if (sc[t] > max_score) max_score = sc[t];
         }
 
-        // Softmax
         float sum = 0;
-        for (int t = 0; t < T; t++) {
-            sc[t] = expf(sc[t] - max_score);
-            sum += sc[t];
-        }
+        for (int t = 0; t < T; t++) { sc[t] = expf(sc[t] - max_score); sum += sc[t]; }
         float inv_sum = 1.0f / sum;
         for (int t = 0; t < T; t++) sc[t] *= inv_sum;
 
-        // Weighted sum of V
         for (int d = 0; d < hd; d++) {
             float val = 0;
-            for (int t = 0; t < T; t++) {
-                int v_idx = (kv_h * hd + d) * c->max_seq + t;
-                val += sc[t] * (float)v_cache[v_idx];
-            }
-            scratch->attn_f32[h * hd + d] = val;
+            for (int t = 0; t < T; t++)
+                val += sc[t] * (float)v_cache[(kv_h * hd + d) * c->max_seq + t];
+            out[h * hd + d] = (_Float16)val;
         }
     }
+}
 
-    // Wo projection: out = Wo @ attn (no residual — caller adds in fp32)
-    // Wo is [dim, dim] fp16, attn is [dim] fp32. Parallel across output rows.
-    int D = c->dim;
-    dispatch_apply(D, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t i) {
-        const _Float16 *row = wo + i * D;
-        const float *src = scratch->attn_f32;
-        int j = 0;
-        float32x4_t acc0 = vdupq_n_f32(0), acc1 = vdupq_n_f32(0);
-        for (; j + 7 < D; j += 8) {
-            float16x8_t w = vld1q_f16((const __fp16*)(row + j));
-            float32x4_t wl = vcvt_f32_f16(vget_low_f16(w));
-            float32x4_t wh = vcvt_f32_f16(vget_high_f16(w));
-            acc0 = vfmaq_f32(acc0, wl, vld1q_f32(src + j));
-            acc1 = vfmaq_f32(acc1, wh, vld1q_f32(src + j + 4));
-        }
-        float val = vaddvq_f32(vaddq_f32(acc0, acc1));
-        for (; j < D; j++) val += (float)row[j] * src[j];
-        out[i] = (_Float16)val;
-    });
+// ========== Wo projection MIL kernel ==========
+// Input: [1, dim, 1, S] — attention output
+// Output: [1, dim, 1, S] — Wo @ attn_out
+static NSString *gen_infer_wo(const InferConfig *c, int S) {
+    NSMutableString *m = [NSMutableString string];
+    [m appendString:INFER_MIL_HDR];
+    [m appendFormat:@"    func main<ios18>(tensor<fp16, [1, %d, 1, %d]> x) {\n", c->dim, S];
+    [m appendString:@INFER_CONV_CONST];
+    [m appendFormat:@"        tensor<fp16, [%d,%d,1,1]> Wo = const()[name=string(\"Wo\"), val=tensor<fp16, [%d,%d,1,1]>(BLOBFILE(path=string(\"@model_path/weights/wo.bin\"), offset=uint64(64)))];\n", c->dim, c->dim, c->dim, c->dim];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> out = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wo,x=x)[name=string(\"co\")];\n", c->dim, S];
+    [m appendString:@"    } -> (out);\n}\n"];
+    return m;
 }
