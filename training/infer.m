@@ -669,24 +669,21 @@ int main(int argc, char **argv) {
             };
             layers[L].qkv = compile_kern_mil_w(qkv_mil, qkv_w,
                 cfg.dim*io_s*2, (cfg.dim+2*cfg.kv_dim)*io_s*2);
+            layers[L].wo = NULL;  // Wo is on Metal now
 
-            NSString *wo_mil = gen_infer_wo(&cfg, io_s);
-            NSDictionary *wo_w = @{
-                @"@model_path/weights/wo.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(wo_f16, cfg.dim, cfg.dim)},
-            };
-            layers[L].wo = compile_kern_mil_w(wo_mil, wo_w, cfg.dim*io_s*2, cfg.dim*io_s*2);
-
-            // FFN weights to Metal GPU (300MB — too large for ANE baked-weight eval)
+            // Wo + RMSNorm + FFN weights to Metal (fused in one command buffer)
             {
                 int D = cfg.dim, H = cfg.hidden_dim;
+                metal->layers[L].Wo = [metal->device newBufferWithBytes:wo_f16 length:(size_t)D*D*2 options:MTLResourceStorageModeShared];
+                metal->layers[L].rms_ffn = [metal->device newBufferWithBytes:rms2 length:(size_t)D*2 options:MTLResourceStorageModeShared];
                 metal->layers[L].W1 = [metal->device newBufferWithBytes:w1_f16 length:(size_t)H*D*2 options:MTLResourceStorageModeShared];
                 metal->layers[L].W3 = [metal->device newBufferWithBytes:w3_f16 length:(size_t)H*D*2 options:MTLResourceStorageModeShared];
                 metal->layers[L].W2 = [metal->device newBufferWithBytes:w2_f16 length:(size_t)D*H*2 options:MTLResourceStorageModeShared];
             }
 
-            // Store RMS norm weights for CPU, QK norm weights
+            // Store RMS att norm weights for CPU (QKV RMSNorm), QK norm weights
             layers[L].rms_att = rms1; rms1 = NULL;
-            layers[L].rms_ffn = rms2; rms2 = NULL;
+            layers[L].rms_ffn = rms2; rms2 = NULL;  // kept for ANE fallback
             layers[L].q_norm = qnorm;
             layers[L].k_norm = knorm;
 
@@ -809,23 +806,13 @@ int main(int argc, char **argv) {
 
             // === Wo + FFN (Metal or ANE) ===
             if (metal) {
-                // ANE Wo projection
-                IOSurfaceLock(layers[L].wo->ioIn, 0, NULL);
-                _Float16 *wo_inp = (_Float16*)IOSurfaceGetBaseAddress(layers[L].wo->ioIn);
-                memset(wo_inp, 0, cfg.dim * DECODE_S * sizeof(_Float16));
-                for (int ci = 0; ci < cfg.dim; ci++) wo_inp[ci * DECODE_S] = delta_f16[ci];
-                IOSurfaceUnlock(layers[L].wo->ioIn, 0, NULL);
-                ane_eval(layers[L].wo);
-                IOSurfaceLock(layers[L].wo->ioOut, kIOSurfaceLockReadOnly, NULL);
-                const _Float16 *wo_out = (const _Float16*)IOSurfaceGetBaseAddress(layers[L].wo->ioOut);
-                for (int ci = 0; ci < cfg.dim; ci++) x[ci] += (float)wo_out[ci * DECODE_S];
-                IOSurfaceUnlock(layers[L].wo->ioOut, kIOSurfaceLockReadOnly, NULL);
-
-                // Metal FFN
-                rmsnorm_f32_to_f16(cfg.dim, x_f16, x, layers[L].rms_ffn);
-                metal_eval_ffn(metal, L, x_f16, delta_f16);
+                // Fused Wo + RMSNorm + FFN in ONE Metal command buffer
+                // Convert fp32 x to fp16 for Metal (used as residual in GPU RMSNorm)
+                for (int ci = 0; ci < cfg.dim; ci++) x_f16[ci] = (_Float16)x[ci];
+                _Float16 wo_d[cfg.dim], ffn_d[cfg.dim];
+                metal_eval_wo_rms_ffn(metal, L, x_f16, delta_f16, wo_d, ffn_d);
                 for (int ci = 0; ci < cfg.dim; ci++)
-                    x[ci] += (float)delta_f16[ci];
+                    x[ci] += (float)wo_d[ci] + (float)ffn_d[ci];
             } else {
                 // ANE Wo
                 IOSurfaceLock(layers[L].wo->ioIn, 0, NULL);
