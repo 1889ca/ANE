@@ -768,7 +768,7 @@ int main(int argc, char **argv) {
 
         // Process through all layers
         for (int L = 0; L < cfg.n_layers; L++) {
-            uint64_t t0 = mach_absolute_time();
+            uint64_t t0 = mach_absolute_time(), ta, tb;
             // CPU RMSNorm (fp32→fp16) then QKV projection on ANE
             rmsnorm_f32_to_f16(cfg.dim, x_f16, x, layers[L].rms_att);
 
@@ -779,7 +779,9 @@ int main(int argc, char **argv) {
                 qkv_inp[ci * DECODE_S] = x_f16[ci];
             IOSurfaceUnlock(layers[L].qkv->ioIn, 0, NULL);
 
+            ta = mach_absolute_time();
             ane_eval(layers[L].qkv);
+            tb = mach_absolute_time();
             uint64_t t1 = mach_absolute_time();
 
             // Read QKV output — channel-first [dim+2*kv_dim, DECODE_S], extract position 0
@@ -820,7 +822,9 @@ int main(int argc, char **argv) {
                 wo_inp[ci * DECODE_S] = delta_f16[ci];
             IOSurfaceUnlock(layers[L].wo->ioIn, 0, NULL);
 
+            ta = mach_absolute_time();
             ane_eval(layers[L].wo);
+            tb = mach_absolute_time();
 
             IOSurfaceLock(layers[L].wo->ioOut, kIOSurfaceLockReadOnly, NULL);
             const _Float16 *wo_outp = (const _Float16*)IOSurfaceGetBaseAddress(layers[L].wo->ioOut);
@@ -840,7 +844,9 @@ int main(int argc, char **argv) {
                 ffn_inp[ci * DECODE_S] = x_f16[ci];
             IOSurfaceUnlock(layers[L].ffn->ioIn, 0, NULL);
 
+            ta = mach_absolute_time();
             ane_eval(layers[L].ffn);
+            tb = mach_absolute_time();
 
             IOSurfaceLock(layers[L].ffn->ioOut, kIOSurfaceLockReadOnly, NULL);
             const _Float16 *ffn_outp = (const _Float16*)IOSurfaceGetBaseAddress(layers[L].ffn->ioOut);
