@@ -29,6 +29,32 @@
 #include "infer_mil.h"
 #include "bonsai_lora.h"
 
+// ========== QK Norm (Qwen3) ==========
+// Per-head RMSNorm on Q[dim] and K[kv_dim] with learned weights[head_dim]
+// Applied after projection, before RoPE
+static void qk_norm_f16(const InferConfig *c, _Float16 *q, _Float16 *k,
+                         const _Float16 *q_norm_w, const _Float16 *k_norm_w) {
+    int hd = c->head_dim;
+    // Q: n_heads groups of head_dim
+    for (int h = 0; h < c->n_heads; h++) {
+        _Float16 *qh = q + h * hd;
+        float ss = 0;
+        for (int i = 0; i < hd; i++) ss += (float)qh[i] * (float)qh[i];
+        float rrms = 1.0f / sqrtf(ss / hd + 1e-6f);
+        for (int i = 0; i < hd; i++)
+            qh[i] = (_Float16)((float)qh[i] * rrms * (float)q_norm_w[i]);
+    }
+    // K: n_kv_heads groups of head_dim
+    for (int h = 0; h < c->n_kv_heads; h++) {
+        _Float16 *kh = k + h * hd;
+        float ss = 0;
+        for (int i = 0; i < hd; i++) ss += (float)kh[i] * (float)kh[i];
+        float rrms = 1.0f / sqrtf(ss / hd + 1e-6f);
+        for (int i = 0; i < hd; i++)
+            kh[i] = (_Float16)((float)kh[i] * rrms * (float)k_norm_w[i]);
+    }
+}
+
 // ========== RoPE for inference ==========
 // Single-position RoPE on fp16 Q[dim] and K[kv_dim] at position pos
 static void rope_single_pos(const InferConfig *c, _Float16 *q, _Float16 *k, int pos) {
@@ -258,9 +284,11 @@ static void tokenizer_free(Tokenizer *t) {
 
 // ========== Per-layer ANE kernels ==========
 typedef struct {
-    Kern *qkv;    // QKV projection (ANE)
-    Kern *ffn;    // FFN (ANE)
-    _Float16 *wo; // Wo weights for CPU attention (persisted)
+    Kern *qkv;        // QKV projection (ANE)
+    Kern *ffn;        // FFN (ANE)
+    _Float16 *wo;     // Wo weights for CPU attention (persisted)
+    _Float16 *q_norm; // QK norm weights [head_dim] (NULL if no QK norm)
+    _Float16 *k_norm; // QK norm weights [head_dim]
 } InferLayerKernels;
 
 // ========== GGUF tensor name helpers for Qwen3 ==========
@@ -337,7 +365,8 @@ int main(int argc, char **argv) {
     mach_timebase_info(&g_tb);
 
     InferConfig cfg;
-    _Float16 *embed = NULL;      // [vocab, dim] embedding/unembedding weights
+    _Float16 *embed = NULL;      // [vocab, dim] embedding weights
+    _Float16 *output_w = NULL;   // [vocab, dim] classifier weights (may == embed)
     _Float16 **wo_weights = NULL; // [n_layers] Wo weight arrays for CPU attention
     InferLayerKernels *layers = NULL;
     _Float16 *rms_final_w = NULL;
@@ -471,6 +500,7 @@ int main(int argc, char **argv) {
         }
         free(rms_att); free(wq); free(wk); free(wv);
         free(rms_ffn); free(w1); free(w2); free(w3);
+        output_w = embed;  // Stories uses shared embed/unembed
         printf("  Done (%d kernels compiled)\n", g_compile_count);
 
     } else {
@@ -493,22 +523,30 @@ int main(int argc, char **argv) {
             }
         }
 
-        // Load embedding weights
+        // Load embedding weights (may be Q1_0_g128, F16, or F32)
         char namebuf[256];
         int erows, ecols;
-        _Float16 *embed_raw = gguf_load_f16(gf, "token_embd.weight", &erows, &ecols);
-        if (!embed_raw) {
+        embed = gguf_load_as_f16(gf, "token_embd.weight", &erows, &ecols);
+        if (!embed) {
             fprintf(stderr, "Failed to load embedding weights\n");
             gguf_close(gf); return 1;
         }
-        embed = embed_raw;
         printf("Embeddings: %dx%d\n", erows, ecols);
 
-        // Load rms_final
+        // Load output projection (separate from embed in Qwen3)
+        int orows, ocols;
+        output_w = gguf_load_as_f16(gf, "output.weight", &orows, &ocols);
+        if (!output_w) {
+            printf("No separate output.weight, using embed for classifier\n");
+            output_w = embed;  // shared weights fallback
+        } else {
+            printf("Output projection: %dx%d\n", orows, ocols);
+        }
+
+        // Load rms_final (F32 in Qwen3 GGUF)
         int rr, rc;
-        _Float16 *rms_raw = gguf_load_f16(gf, "output_norm.weight", &rr, &rc);
-        if (!rms_raw) { fprintf(stderr, "Failed to load output_norm\n"); return 1; }
-        rms_final_w = rms_raw;
+        rms_final_w = gguf_load_as_f16(gf, "output_norm.weight", &rr, &rc);
+        if (!rms_final_w) { fprintf(stderr, "Failed to load output_norm\n"); return 1; }
 
         // Compile ANE kernels per layer
         printf("Compiling %d layers...\n", cfg.n_layers);
@@ -530,8 +568,15 @@ int main(int argc, char **argv) {
             _Float16 *w2_f16 = gguf_load_q1_fp16(gf, qwen3_name(namebuf, L, "ffn_down.weight"), &r, &c_dim);
 
             int rr2, rc2;
-            _Float16 *rms1 = gguf_load_f16(gf, qwen3_name(namebuf, L, "attn_norm.weight"), &rr2, &rc2);
-            _Float16 *rms2 = gguf_load_f16(gf, qwen3_name(namebuf, L, "ffn_norm.weight"), &rr2, &rc2);
+            _Float16 *rms1 = gguf_load_as_f16(gf, qwen3_name(namebuf, L, "attn_norm.weight"), &rr2, &rc2);
+            _Float16 *rms2 = gguf_load_as_f16(gf, qwen3_name(namebuf, L, "ffn_norm.weight"), &rr2, &rc2);
+
+            // QK norm weights (Qwen3)
+            _Float16 *qnorm = NULL, *knorm = NULL;
+            if (cfg.qk_norm) {
+                qnorm = gguf_load_as_f16(gf, qwen3_name(namebuf, L, "attn_q_norm.weight"), &rr2, &rc2);
+                knorm = gguf_load_as_f16(gf, qwen3_name(namebuf, L, "attn_k_norm.weight"), &rr2, &rc2);
+            }
 
             if (!wq_f16 || !wk_f16 || !wv_f16 || !wo_f16 || !w1_f16 || !w3_f16 || !w2_f16 || !rms1 || !rms2) {
                 fprintf(stderr, "Failed to load weights for layer %d\n", L);
@@ -579,9 +624,11 @@ int main(int argc, char **argv) {
             };
             layers[L].ffn = compile_kern_mil_w(ffn_mil, ffn_w, cfg.dim*DECODE_S*2, cfg.dim*DECODE_S*2);
 
-            // Keep Wo for CPU attention
+            // Keep Wo for CPU attention, QK norm weights for CPU norm
             layers[L].wo = wo_f16;
             wo_weights[L] = wo_f16;
+            layers[L].q_norm = qnorm;
+            layers[L].k_norm = knorm;
 
             // Free weights baked into kernels
             free(wq_f16); free(wk_f16); free(wv_f16);
@@ -683,6 +730,10 @@ int main(int argc, char **argv) {
 
             IOSurfaceUnlock(layers[L].qkv->ioOut, kIOSurfaceLockReadOnly, NULL);
 
+            // QK norm (Qwen3): per-head RMSNorm on Q and K before RoPE
+            if (cfg.qk_norm && layers[L].q_norm)
+                qk_norm_f16(&cfg, q_buf, k_buf, layers[L].q_norm, layers[L].k_norm);
+
             // RoPE on Q and K for this position
             rope_single_pos(&cfg, q_buf, k_buf, pos);
 
@@ -721,7 +772,7 @@ int main(int argc, char **argv) {
             rmsnorm_f16(&cfg, x_norm, x, rms_final_w);
 
             // Classifier: embed @ x_norm → logits
-            classifier_f16(&cfg, logits, embed, x_norm);
+            classifier_f16(&cfg, logits, output_w, x_norm);
 
             // Sample
             int next_tok;
@@ -734,7 +785,7 @@ int main(int argc, char **argv) {
             tokens[n_tokens - 1 + generated] = next_tok;
 
             // Print token
-            if (next_tok == 2 || next_tok == 0) break;  // EOS/PAD
+            if (next_tok == 2 || next_tok == 0 || next_tok == 151643) break;  // EOS/PAD/Qwen3 EOS
             if (tokenizer) {
                 const char *piece = tokenizer_decode(tokenizer, next_tok);
                 // Handle hex-encoded bytes like <0x0A>
@@ -766,11 +817,15 @@ int main(int argc, char **argv) {
     kv_cache_free(kv);
     attn_decode_scratch_free(attn_scratch);
     free(x); free(q_buf); free(k_buf); free(v_buf); free(x_norm);
-    free(logits); free(tokens); free(embed); free(rms_final_w);
+    free(logits); free(tokens); free(embed);
+    if (output_w != embed) free(output_w);
+    free(rms_final_w);
     for (int L = 0; L < cfg.n_layers; L++) {
         free_kern(layers[L].qkv);
         free_kern(layers[L].ffn);
         free(wo_weights[L]);
+        free(layers[L].q_norm);
+        free(layers[L].k_norm);
     }
     free(layers); free(wo_weights);
     tokenizer_free(tokenizer);

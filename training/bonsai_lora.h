@@ -326,6 +326,37 @@ static _Float16 *gguf_load_f16(GGUFFile *gf, const char *name, int *out_rows, in
     return out;
 }
 
+// Load F32 tensor and convert to fp16
+static _Float16 *gguf_load_f32_as_f16(GGUFFile *gf, const char *name, int *out_rows, int *out_cols) {
+    GGUFTensor *t = gguf_find(gf, name);
+    if (!t) { fprintf(stderr, "GGUF: tensor '%s' not found\n", name); return NULL; }
+    if (t->dtype != GGUF_TYPE_F32) {
+        fprintf(stderr, "GGUF: tensor '%s' is dtype %d, expected F32 (%d)\n",
+                name, t->dtype, GGUF_TYPE_F32);
+        return NULL;
+    }
+    *out_rows = (int)(t->n_dims >= 2 ? t->dims[1] : 1);
+    *out_cols = (int)t->dims[0];
+    const float *src = (const float *)gguf_tensor_data(gf, t);
+    _Float16 *out = (_Float16 *)malloc(t->n_elements * sizeof(_Float16));
+    for (uint64_t i = 0; i < t->n_elements; i++) out[i] = (_Float16)src[i];
+    return out;
+}
+
+// Load tensor as fp16 regardless of source dtype (F16, F32, or Q1_0_g128)
+static _Float16 *gguf_load_as_f16(GGUFFile *gf, const char *name, int *out_rows, int *out_cols) {
+    GGUFTensor *t = gguf_find(gf, name);
+    if (!t) { fprintf(stderr, "GGUF: tensor '%s' not found\n", name); return NULL; }
+    switch (t->dtype) {
+        case GGUF_TYPE_F16: return gguf_load_f16(gf, name, out_rows, out_cols);
+        case GGUF_TYPE_F32: return gguf_load_f32_as_f16(gf, name, out_rows, out_cols);
+        case GGUF_TYPE_Q1_0_G128: return gguf_load_q1_fp16(gf, name, out_rows, out_cols);
+        default:
+            fprintf(stderr, "GGUF: tensor '%s' has unsupported dtype %d\n", name, t->dtype);
+            return NULL;
+    }
+}
+
 static void gguf_close(GGUFFile *gf) {
     if (!gf) return;
     munmap(gf->data, gf->file_size);
