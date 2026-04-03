@@ -10,8 +10,8 @@ static NSString *const metal_shader_source = @R"(
 #include <metal_stdlib>
 using namespace metal;
 
-// Matrix-vector multiply: one threadgroup (32 threads) per output row
-// 32 threads collaboratively sum K elements via simd_sum
+// Matrix-vector multiply: one simdgroup (32 threads) per output row
+// 32 threads stride through K elements, reduce via simd_sum
 kernel void matvec_f16(
     device const half *W [[buffer(0)]],
     device const half *x [[buffer(1)]],
@@ -22,7 +22,6 @@ kernel void matvec_f16(
 {
     float sum = 0.0f;
     uint base = row * K;
-    // Stride by 32 threads, each accumulates K/32 elements
     for (uint j = lane * 4; j < K; j += 128) {
         half4 w = *reinterpret_cast<device const half4*>(W + base + j);
         half4 v = *reinterpret_cast<device const half4*>(x + j);
@@ -69,7 +68,9 @@ typedef struct {
     id<MTLBuffer> buf_gate;    // [hidden] after silu*gate
     id<MTLBuffer> buf_ffn_out; // [dim] FFN output
     MetalLayerWeights *layers;
-    int n_layers, dim, kv_dim, hidden_dim;
+    id<MTLBuffer> buf_cls_w;   // [vocab, dim] classifier weights
+    id<MTLBuffer> buf_cls_out; // [vocab] classifier logits (fp16 → convert to fp32 on CPU)
+    int n_layers, dim, kv_dim, hidden_dim, vocab_size;
     NSUInteger tgSize;
 } MetalInfer;
 
@@ -79,6 +80,7 @@ static MetalInfer *metal_init(const InferConfig *cfg) {
     m->kv_dim = cfg->kv_dim;
     m->hidden_dim = cfg->hidden_dim;
     m->n_layers = cfg->n_layers;
+    m->vocab_size = cfg->vocab_size;
 
     m->device = MTLCreateSystemDefaultDevice();
     if (!m->device) { fprintf(stderr, "Metal: no device\n"); free(m); return NULL; }
@@ -304,6 +306,40 @@ static void metal_eval_wo_ffn(MetalInfer *m, int L,
 
     memcpy(wo_out, [m->buf_wo contents], D * 2);
     memcpy(ffn_out, [m->buf_ffn_out contents], D * 2);
+}
+
+// Load classifier weights to Metal
+static void metal_load_classifier(MetalInfer *m, const _Float16 *w, int vocab, int dim) {
+    size_t sz = (size_t)vocab * dim * 2;
+    m->buf_cls_w = [m->device newBufferWithBytes:w length:sz options:MTLResourceStorageModeShared];
+    m->buf_cls_out = [m->device newBufferWithLength:vocab * 2 options:MTLResourceStorageModeShared];
+}
+
+// Metal classifier: output_w[vocab, dim] @ x_norm[dim] → logits[vocab] fp32
+static void metal_classifier(MetalInfer *m, const _Float16 *x_norm, float *logits) {
+    int V = m->vocab_size, D = m->dim;
+    memcpy([m->buf_x contents], x_norm, D * 2);
+
+    @autoreleasepool {
+    id<MTLCommandBuffer> cmd = [m->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+    uint32_t K = (uint32_t)D;
+    [enc setComputePipelineState:m->matvec_pipe];
+    [enc setBuffer:m->buf_cls_w offset:0 atIndex:0];
+    [enc setBuffer:m->buf_x offset:0 atIndex:1];
+    [enc setBuffer:m->buf_cls_out offset:0 atIndex:2];
+    [enc setBytes:&K length:4 atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake(V, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    }
+
+    // Convert fp16 → fp32
+    const _Float16 *cls_f16 = (const _Float16 *)[m->buf_cls_out contents];
+    for (int i = 0; i < V; i++) logits[i] = (float)cls_f16[i];
 }
 
 static void metal_free(MetalInfer *m) {

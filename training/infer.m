@@ -676,9 +676,13 @@ int main(int argc, char **argv) {
             };
             layers[L].wo = compile_kern_mil_w(wo_mil, wo_w, cfg.dim*io_s*2, cfg.dim*io_s*2);
 
-            // FFN on Metal GPU (300MB weights — too large for ANE baked-weight eval)
-            metal_load_layer(metal, L, wq_f16, wk_f16, wv_f16, wo_f16,
-                            w1_f16, w3_f16, w2_f16);
+            // FFN weights to Metal GPU (300MB — too large for ANE baked-weight eval)
+            {
+                int D = cfg.dim, H = cfg.hidden_dim;
+                metal->layers[L].W1 = [metal->device newBufferWithBytes:w1_f16 length:(size_t)H*D*2 options:MTLResourceStorageModeShared];
+                metal->layers[L].W3 = [metal->device newBufferWithBytes:w3_f16 length:(size_t)H*D*2 options:MTLResourceStorageModeShared];
+                metal->layers[L].W2 = [metal->device newBufferWithBytes:w2_f16 length:(size_t)D*H*2 options:MTLResourceStorageModeShared];
+            }
 
             // Store RMS norm weights for CPU, QK norm weights
             layers[L].rms_att = rms1; rms1 = NULL;
@@ -691,6 +695,9 @@ int main(int argc, char **argv) {
             free(w1_f16); free(w2_f16); free(w3_f16);
         }
         printf("  Done (%d kernels compiled)\n", g_compile_count);
+
+        // Load classifier weights to Metal
+        if (metal) metal_load_classifier(metal, output_w, cfg.vocab_size, cfg.dim);
 
         if (lora_gf) gguf_close(lora_gf);
         xor_patch_free(xor_patch);
@@ -858,7 +865,7 @@ int main(int argc, char **argv) {
             // Final RMSNorm in fp32 → fp16
             rmsnorm_f32_to_f16(cfg.dim, x_norm, x, rms_final_w);
 
-            // Classifier: embed @ x_norm → logits
+            // Classifier: output_w @ x_norm → logits
             uint64_t tc0 = mach_absolute_time();
             classifier_f16(&cfg, logits, output_w, x_norm);
             t_cls += tb_ms(mach_absolute_time() - tc0);
