@@ -29,6 +29,7 @@
 #include "infer_mil.h"
 #include "bonsai_lora.h"
 #include "infer_tokenizer.h"
+#include "infer_xor_patch.h"
 
 // ========== QK Norm (Qwen3) ==========
 // Per-head RMSNorm on Q[dim] and K[kv_dim] with learned weights[head_dim]
@@ -337,6 +338,7 @@ int main(int argc, char **argv) {
     // Parse args
     const char *model_path = NULL;
     const char *lora_path = NULL;
+    const char *xor_path = NULL;
     const char *prompt = "Once upon a time";
     int max_tokens = 128;
     float temperature = 0.7f;
@@ -351,11 +353,12 @@ int main(int argc, char **argv) {
         {"temp", required_argument, 0, 't'},
         {"topp", required_argument, 0, 'k'},
         {"stories", no_argument, 0, 's'},
+        {"xor", required_argument, 0, 'x'},
         {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "m:l:p:n:t:k:s", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "m:l:p:n:t:k:sx:", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'm': model_path = optarg; break;
             case 'l': lora_path = optarg; break;
@@ -364,12 +367,13 @@ int main(int argc, char **argv) {
             case 't': temperature = atof(optarg); break;
             case 'k': topp = atof(optarg); break;
             case 's': use_stories = 1; break;
+            case 'x': xor_path = optarg; break;
         }
     }
 
     if (!model_path && !use_stories) {
-        fprintf(stderr, "Usage: %s --model <gguf> [--lora <gguf>] [--prompt \"text\"] "
-                "[--max-tokens N] [--temp F] [--topp F] [--stories]\n", argv[0]);
+        fprintf(stderr, "Usage: %s --model <gguf> [--lora <gguf>] [--xor <patch.json>] "
+                "[--prompt \"text\"] [--max-tokens N] [--temp F] [--topp F] [--stories]\n", argv[0]);
         return 1;
     }
 
@@ -539,6 +543,12 @@ int main(int argc, char **argv) {
             }
         }
 
+        // Load XOR patch if provided
+        XORPatch *xor_patch = NULL;
+        if (xor_path) {
+            xor_patch = xor_patch_load(xor_path);
+        }
+
         // Load embedding weights (may be Q1_0_g128, F16, or F32)
         char namebuf[256];
         int erows, ecols;
@@ -620,6 +630,17 @@ int main(int argc, char **argv) {
                 }
             }
 
+            // Apply XOR patch flips (negate rows in weight matrices)
+            if (xor_patch) {
+                xor_patch_apply_f16(wq_f16, cfg.dim, cfg.dim, xor_patch, L, XOR_PROJ_Q);
+                xor_patch_apply_f16(wk_f16, cfg.kv_dim, cfg.dim, xor_patch, L, XOR_PROJ_K);
+                xor_patch_apply_f16(wv_f16, cfg.kv_dim, cfg.dim, xor_patch, L, XOR_PROJ_V);
+                xor_patch_apply_f16(wo_f16, cfg.dim, cfg.dim, xor_patch, L, XOR_PROJ_O);
+                xor_patch_apply_f16(w1_f16, cfg.hidden_dim, cfg.dim, xor_patch, L, XOR_PROJ_GATE);
+                xor_patch_apply_f16(w3_f16, cfg.hidden_dim, cfg.dim, xor_patch, L, XOR_PROJ_UP);
+                xor_patch_apply_f16(w2_f16, cfg.dim, cfg.hidden_dim, xor_patch, L, XOR_PROJ_DOWN);
+            }
+
             // QKV kernel (no RMSNorm — done on CPU in fp32)
             NSString *qkv_mil = gen_infer_qkv(&cfg, DECODE_S);
             NSDictionary *qkv_w = @{
@@ -656,6 +677,7 @@ int main(int argc, char **argv) {
         printf("  Done (%d kernels compiled)\n", g_compile_count);
 
         if (lora_gf) gguf_close(lora_gf);
+        xor_patch_free(xor_patch);
         gguf_close(gf);
     }
 
