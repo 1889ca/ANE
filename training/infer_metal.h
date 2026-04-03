@@ -90,6 +90,7 @@ kernel void silu_gate_f16(
 // Per-layer weight buffers
 typedef struct {
     id<MTLBuffer> Wqkv;    // fused [dim + 2*kv_dim, dim] fp16
+    id<MTLBuffer> rms_att; // [dim] fp16 attention RMSNorm weights
     id<MTLBuffer> Wo;      // [dim, dim] fp16
     id<MTLBuffer> rms_ffn; // [dim] fp16 FFN RMSNorm weights
     id<MTLBuffer> W1;      // [hidden, dim] fp16
@@ -192,6 +193,47 @@ static void metal_load_layer(MetalInfer *m, int L,
 }
 
 // ===== Eval functions =====
+
+// RMSNorm + QKV in one command buffer (2 dispatches, 1 sync)
+// x: [dim] fp16 (raw residual stream), outputs Q, K, V
+static void metal_eval_rms_qkv(MetalInfer *m, int L, const _Float16 *x_fp16,
+                                _Float16 *q_out, _Float16 *k_out, _Float16 *v_out) {
+    int D = m->dim, KD = m->kv_dim;
+    memcpy([m->buf_x contents], x_fp16, D * 2);
+
+    @autoreleasepool {
+    id<MTLCommandBuffer> cmd = [m->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+    // RMSNorm(x, rms_att) → buf_ffn_in (reuse as temp normalized output)
+    uint32_t dim32 = (uint32_t)D;
+    [enc setComputePipelineState:m->rmsnorm_pipe];
+    [enc setBuffer:m->buf_x offset:0 atIndex:0];
+    [enc setBuffer:m->layers[L].rms_att offset:0 atIndex:1];
+    [enc setBuffer:m->buf_ffn_in offset:0 atIndex:2];  // reuse as temp
+    [enc setBytes:&dim32 length:4 atIndex:3];
+    [enc setThreadgroupMemoryLength:1024 * sizeof(float) atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+
+    // Fused QKV matvec
+    uint32_t K = (uint32_t)D;
+    [enc setComputePipelineState:m->matvec_pipe];
+    [enc setBuffer:m->layers[L].Wqkv offset:0 atIndex:0];
+    [enc setBuffer:m->buf_ffn_in offset:0 atIndex:1];
+    [enc setBuffer:m->buf_qkv offset:0 atIndex:2];
+    [enc setBytes:&K length:4 atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake(D + 2*KD, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    }
+
+    const _Float16 *qkv = (const _Float16 *)[m->buf_qkv contents];
+    memcpy(q_out, qkv, D * 2);
+    memcpy(k_out, qkv + D, KD * 2);
+    memcpy(v_out, qkv + D + KD, KD * 2);
+}
 
 // QKV projection: x_norm[dim] → Q[dim], K[kv_dim], V[kv_dim]
 // Uses fused Wqkv matrix — one matvec dispatch

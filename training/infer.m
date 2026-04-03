@@ -659,7 +659,7 @@ int main(int argc, char **argv) {
                 xor_patch_apply_f16(w2_f16, cfg.dim, cfg.hidden_dim, xor_patch, L, XOR_PROJ_DOWN);
             }
 
-            // QKV + Wo on ANE (low-latency for dim×dim matmuls)
+            // QKV on ANE (lower per-eval overhead than Metal command buffer)
             int io_s = DECODE_S;
             NSString *qkv_mil = gen_infer_qkv(&cfg, io_s);
             NSDictionary *qkv_w = @{
@@ -669,11 +669,13 @@ int main(int argc, char **argv) {
             };
             layers[L].qkv = compile_kern_mil_w(qkv_mil, qkv_w,
                 cfg.dim*io_s*2, (cfg.dim+2*cfg.kv_dim)*io_s*2);
-            layers[L].wo = NULL;  // Wo is on Metal now
+            layers[L].wo = NULL;
 
-            // Wo + RMSNorm + FFN weights to Metal (fused in one command buffer)
+            // All projection weights to Metal
             {
                 int D = cfg.dim, H = cfg.hidden_dim;
+                metal->layers[L].rms_att = [metal->device newBufferWithBytes:rms1 length:(size_t)D*2 options:MTLResourceStorageModeShared];
+                metal->layers[L].Wqkv = metal_fuse_qkv(metal, wq_f16, wk_f16, wv_f16);
                 metal->layers[L].Wo = [metal->device newBufferWithBytes:wo_f16 length:(size_t)D*D*2 options:MTLResourceStorageModeShared];
                 metal->layers[L].rms_ffn = [metal->device newBufferWithBytes:rms2 length:(size_t)D*2 options:MTLResourceStorageModeShared];
                 metal->layers[L].W1 = [metal->device newBufferWithBytes:w1_f16 length:(size_t)H*D*2 options:MTLResourceStorageModeShared];
@@ -772,11 +774,11 @@ int main(int argc, char **argv) {
         for (int L = 0; L < cfg.n_layers; L++) {
             uint64_t t0 = mach_absolute_time();
 
-            // === QKV projection (Metal or ANE) ===
-            rmsnorm_f32_to_f16(cfg.dim, x_f16, x, layers[L].rms_att);
-            if (0 && metal) {
-                metal_eval_qkv(metal, L, x_f16, q_buf, k_buf, v_buf);
+            // === QKV projection (ANE — lower latency than Metal for dim×dim) ===
+            if (0) {
+                // Metal path (kept for reference, slower due to cmd buf overhead)
             } else {
+                rmsnorm_f32_to_f16(cfg.dim, x_f16, x, layers[L].rms_att);
                 IOSurfaceLock(layers[L].qkv->ioIn, 0, NULL);
                 _Float16 *qkv_inp = (_Float16*)IOSurfaceGetBaseAddress(layers[L].qkv->ioIn);
                 memset(qkv_inp, 0, cfg.dim * DECODE_S * sizeof(_Float16));
