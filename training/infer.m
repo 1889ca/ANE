@@ -774,11 +774,9 @@ int main(int argc, char **argv) {
         for (int L = 0; L < cfg.n_layers; L++) {
             uint64_t t0 = mach_absolute_time();
 
-            // === QKV projection (ANE — lower latency than Metal for dim×dim) ===
-            if (0) {
-                // Metal path (kept for reference, slower due to cmd buf overhead)
-            } else {
-                rmsnorm_f32_to_f16(cfg.dim, x_f16, x, layers[L].rms_att);
+            // === QKV projection (ANE) ===
+            rmsnorm_f32_to_f16(cfg.dim, x_f16, x, layers[L].rms_att);
+            if (layers[L].qkv) {
                 IOSurfaceLock(layers[L].qkv->ioIn, 0, NULL);
                 _Float16 *qkv_inp = (_Float16*)IOSurfaceGetBaseAddress(layers[L].qkv->ioIn);
                 memset(qkv_inp, 0, cfg.dim * DECODE_S * sizeof(_Float16));
@@ -808,8 +806,6 @@ int main(int argc, char **argv) {
 
             // === Wo + FFN (Metal or ANE) ===
             if (metal) {
-                // Fused Wo + RMSNorm + FFN in ONE Metal command buffer
-                // Convert fp32 x to fp16 for Metal (used as residual in GPU RMSNorm)
                 for (int ci = 0; ci < cfg.dim; ci++) x_f16[ci] = (_Float16)x[ci];
                 _Float16 wo_d[cfg.dim], ffn_d[cfg.dim];
                 metal_eval_wo_rms_ffn(metal, L, x_f16, delta_f16, wo_d, ffn_d);

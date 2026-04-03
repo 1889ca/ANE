@@ -403,11 +403,93 @@ static void metal_eval_wo_ffn(MetalInfer *m, int L,
     memcpy(ffn_out, [m->buf_ffn_out contents], D * 2);
 }
 
+// Async command buffer for pipelining with ANE
+static id<MTLCommandBuffer> g_pending_cmd = nil;
+
+// Launch Wo+RMS+FFN async (no wait). Call metal_sync_wo_rms_ffn to wait and read results.
+static void metal_launch_wo_rms_ffn(MetalInfer *m, int L,
+                                     const _Float16 *x_res, const _Float16 *attn_out) {
+    int D = m->dim, H = m->hidden_dim;
+    memcpy([m->buf_x_res contents], x_res, D * 2);
+    memcpy([m->buf_attn contents], attn_out, D * 2);
+
+    @autoreleasepool {
+    id<MTLCommandBuffer> cmd = [m->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    uint32_t K;
+
+    // 1. Wo
+    K = (uint32_t)D;
+    [enc setComputePipelineState:m->matvec_pipe];
+    [enc setBuffer:m->layers[L].Wo offset:0 atIndex:0];
+    [enc setBuffer:m->buf_attn offset:0 atIndex:1];
+    [enc setBuffer:m->buf_wo offset:0 atIndex:2];
+    [enc setBytes:&K length:4 atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake(D, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+    // 2. x2 = x_res + wo
+    [enc setComputePipelineState:m->residual_add_pipe];
+    [enc setBuffer:m->buf_x_res offset:0 atIndex:0];
+    [enc setBuffer:m->buf_wo offset:0 atIndex:1];
+    [enc setBuffer:m->buf_x2 offset:0 atIndex:2];
+    [enc dispatchThreads:MTLSizeMake(D, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+    // 3. RMSNorm
+    uint32_t dim32 = (uint32_t)D;
+    [enc setComputePipelineState:m->rmsnorm_pipe];
+    [enc setBuffer:m->buf_x2 offset:0 atIndex:0];
+    [enc setBuffer:m->layers[L].rms_ffn offset:0 atIndex:1];
+    [enc setBuffer:m->buf_ffn_in offset:0 atIndex:2];
+    [enc setBytes:&dim32 length:4 atIndex:3];
+    [enc setThreadgroupMemoryLength:1024 * sizeof(float) atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+
+    // 4-7. FFN
+    K = (uint32_t)D;
+    [enc setComputePipelineState:m->matvec_pipe];
+    [enc setBuffer:m->layers[L].W1 offset:0 atIndex:0];
+    [enc setBuffer:m->buf_ffn_in offset:0 atIndex:1];
+    [enc setBuffer:m->buf_h13 offset:0 atIndex:2];
+    [enc setBytes:&K length:4 atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake(H, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+    [enc setBuffer:m->layers[L].W3 offset:0 atIndex:0];
+    [enc setBuffer:m->buf_h13 offset:H*2 atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake(H, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+    [enc setComputePipelineState:m->silu_gate_pipe];
+    [enc setBuffer:m->buf_h13 offset:0 atIndex:0];
+    [enc setBuffer:m->buf_h13 offset:H*2 atIndex:1];
+    [enc setBuffer:m->buf_gate offset:0 atIndex:2];
+    [enc dispatchThreads:MTLSizeMake(H, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+    K = (uint32_t)H;
+    [enc setComputePipelineState:m->matvec_pipe];
+    [enc setBuffer:m->layers[L].W2 offset:0 atIndex:0];
+    [enc setBuffer:m->buf_gate offset:0 atIndex:1];
+    [enc setBuffer:m->buf_ffn_out offset:0 atIndex:2];
+    [enc setBytes:&K length:4 atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake(D, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+    [enc endEncoding];
+    [cmd commit];
+    g_pending_cmd = cmd;  // don't wait yet!
+    }
+}
+
+// Wait for async Metal and read results
+static void metal_sync_wo_rms_ffn(MetalInfer *m, _Float16 *wo_out, _Float16 *ffn_out) {
+    if (g_pending_cmd) {
+        [g_pending_cmd waitUntilCompleted];
+        g_pending_cmd = nil;
+    }
+    int D = m->dim;
+    memcpy(wo_out, [m->buf_wo contents], D * 2);
+    memcpy(ffn_out, [m->buf_ffn_out contents], D * 2);
+}
+
+// Synchronous version (for compatibility)
 // Fused Wo + residual + RMSNorm + FFN in ONE command buffer (1 GPU sync)
-// x_res: [dim] fp16 (current residual stream, converted from fp32 by caller)
-// attn_out: [dim] fp16 (raw attention output before Wo)
-// wo_out: [dim] fp16 OUTPUT — Wo@attn_out (caller adds to fp32 residual)
-// ffn_out: [dim] fp16 OUTPUT — FFN delta (caller adds to fp32 residual)
 static void metal_eval_wo_rms_ffn(MetalInfer *m, int L,
                                    const _Float16 *x_res, const _Float16 *attn_out,
                                    _Float16 *wo_out, _Float16 *ffn_out) {
