@@ -141,28 +141,41 @@ static void rmsnorm_f32_to_f16(int dim, _Float16 *out, const float *x, const _Fl
 
 // ========== CPU classifier ==========
 // embed: [vocab, dim] fp16, x: [dim] fp16 → logits: [vocab] fp32
+// Parallel NEON: dispatch_apply across vocab rows
 static void classifier_f16(const InferConfig *c, float *logits, const _Float16 *embed, const _Float16 *x) {
-    for (int v = 0; v < c->vocab_size; v++) {
-        float dot = 0;
-        const _Float16 *row = embed + v * c->dim;
+    int V = c->vocab_size, D = c->dim;
+    int chunk = 256;  // process 256 vocab rows per dispatch unit
+    int n_chunks = (V + chunk - 1) / chunk;
+    dispatch_apply(n_chunks, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t ci) {
+      int v_start = (int)ci * chunk;
+      int v_end = v_start + chunk; if (v_end > V) v_end = V;
+      for (int v = v_start; v < v_end; v++) {
+        const _Float16 *row = embed + v * D;
         int i = 0;
-        // NEON fp16 dot product
         float32x4_t acc0 = vdupq_n_f32(0), acc1 = vdupq_n_f32(0);
-        for (; i + 7 < c->dim; i += 8) {
+        float32x4_t acc2 = vdupq_n_f32(0), acc3 = vdupq_n_f32(0);
+        for (; i + 15 < D; i += 16) {
+            float16x8_t a0 = vld1q_f16((const __fp16*)(row + i));
+            float16x8_t b0 = vld1q_f16((const __fp16*)(x + i));
+            float16x8_t a1 = vld1q_f16((const __fp16*)(row + i + 8));
+            float16x8_t b1 = vld1q_f16((const __fp16*)(x + i + 8));
+            acc0 = vfmaq_f32(acc0, vcvt_f32_f16(vget_low_f16(a0)), vcvt_f32_f16(vget_low_f16(b0)));
+            acc1 = vfmaq_f32(acc1, vcvt_f32_f16(vget_high_f16(a0)), vcvt_f32_f16(vget_high_f16(b0)));
+            acc2 = vfmaq_f32(acc2, vcvt_f32_f16(vget_low_f16(a1)), vcvt_f32_f16(vget_low_f16(b1)));
+            acc3 = vfmaq_f32(acc3, vcvt_f32_f16(vget_high_f16(a1)), vcvt_f32_f16(vget_high_f16(b1)));
+        }
+        for (; i + 7 < D; i += 8) {
             float16x8_t a = vld1q_f16((const __fp16*)(row + i));
             float16x8_t b = vld1q_f16((const __fp16*)(x + i));
-            float32x4_t al = vcvt_f32_f16(vget_low_f16(a));
-            float32x4_t ah = vcvt_f32_f16(vget_high_f16(a));
-            float32x4_t bl = vcvt_f32_f16(vget_low_f16(b));
-            float32x4_t bh = vcvt_f32_f16(vget_high_f16(b));
-            acc0 = vfmaq_f32(acc0, al, bl);
-            acc1 = vfmaq_f32(acc1, ah, bh);
+            acc0 = vfmaq_f32(acc0, vcvt_f32_f16(vget_low_f16(a)), vcvt_f32_f16(vget_low_f16(b)));
+            acc1 = vfmaq_f32(acc1, vcvt_f32_f16(vget_high_f16(a)), vcvt_f32_f16(vget_high_f16(b)));
         }
-        acc0 = vaddq_f32(acc0, acc1);
-        dot = vaddvq_f32(acc0);
-        for (; i < c->dim; i++) dot += (float)row[i] * (float)x[i];
+        acc0 = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+        float dot = vaddvq_f32(acc0);
+        for (; i < D; i++) dot += (float)row[i] * (float)x[i];
         logits[v] = dot;
-    }
+      }
+    });
 }
 
 // ========== Sampling ==========
@@ -737,6 +750,8 @@ int main(int argc, char **argv) {
     uint64_t t_start = mach_absolute_time();
     int generated = 0;
 
+    double t_ane = 0, t_attn = 0, t_cls = 0, t_other = 0;
+
     // Process tokens one at a time (simple decode loop, no prefill optimization yet)
     for (int pos = 0; pos < n_tokens + max_tokens - 1; pos++) {
         int tok = (pos < n_tokens) ? tokens[pos] : tokens[n_tokens - 1 + generated];
@@ -748,6 +763,7 @@ int main(int argc, char **argv) {
 
         // Process through all layers
         for (int L = 0; L < cfg.n_layers; L++) {
+            uint64_t t0 = mach_absolute_time();
             // CPU RMSNorm (fp32→fp16) then QKV projection on ANE
             rmsnorm_f32_to_f16(cfg.dim, x_f16, x, layers[L].rms_att);
 
@@ -759,6 +775,7 @@ int main(int argc, char **argv) {
             IOSurfaceUnlock(layers[L].qkv->ioIn, 0, NULL);
 
             ane_eval(layers[L].qkv);
+            uint64_t t1 = mach_absolute_time();
 
             // Read QKV output — channel-first [dim+2*kv_dim, DECODE_S], extract position 0
             IOSurfaceLock(layers[L].qkv->ioOut, kIOSurfaceLockReadOnly, NULL);
@@ -784,6 +801,7 @@ int main(int argc, char **argv) {
             // Append K, V to cache
             kv_cache_append1(kv, L, k_buf, v_buf);
 
+            uint64_t t2 = mach_absolute_time();
             // CPU attention decode — outputs delta (no residual), add in fp32
             int T = pos + 1;
             cpu_attn_decode(&cfg, q_buf, kv->layers[L].k, kv->layers[L].v,
@@ -792,6 +810,7 @@ int main(int argc, char **argv) {
                 x[ci] += (float)delta_f16[ci];
 
 
+            uint64_t t3 = mach_absolute_time();
             // CPU RMSNorm (fp32→fp16) then FFN on ANE
             rmsnorm_f32_to_f16(cfg.dim, x_f16, x, layers[L].rms_ffn);
 
@@ -810,6 +829,10 @@ int main(int argc, char **argv) {
                 x[ci] += (float)ffn_outp[ci * DECODE_S];  // residual add in fp32
             IOSurfaceUnlock(layers[L].ffn->ioOut, kIOSurfaceLockReadOnly, NULL);
 
+            uint64_t t4 = mach_absolute_time();
+            t_ane += tb_ms(t1 - t0) + tb_ms(t4 - t3);
+            t_attn += tb_ms(t3 - t2);
+            t_other += tb_ms(t2 - t1);
         }
 
         // Advance KV cache position
@@ -822,7 +845,9 @@ int main(int argc, char **argv) {
             rmsnorm_f32_to_f16(cfg.dim, x_norm, x, rms_final_w);
 
             // Classifier: embed @ x_norm → logits
+            uint64_t tc0 = mach_absolute_time();
             classifier_f16(&cfg, logits, output_w, x_norm);
+            t_cls += tb_ms(mach_absolute_time() - tc0);
 
             // Sample
             int next_tok;
@@ -865,9 +890,11 @@ int main(int argc, char **argv) {
 
     uint64_t t_end = mach_absolute_time();
     double elapsed_ms = tb_ms(t_end - t_start);
-    printf("\n\n--- %d tokens in %.1f ms (%.1f ms/tok, %.1f tok/s) ---\n",
+    printf("\n\n--- %d tokens in %.1f ms (%.1f ms/tok, %.1f tok/s) ---\n"
+           "    ane=%.1fms attn=%.1fms cls=%.1fms io=%.1fms\n",
            generated, elapsed_ms, elapsed_ms / (generated ? generated : 1),
-           generated * 1000.0 / elapsed_ms);
+           generated * 1000.0 / elapsed_ms,
+           t_ane, t_attn, t_cls, t_other);
 
     // Cleanup
     kv_cache_free(kv);

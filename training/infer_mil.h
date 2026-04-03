@@ -272,11 +272,22 @@ static void cpu_attn_decode(const InferConfig *c, const _Float16 *q_rope,
     }
 
     // Wo projection: out = Wo @ attn (no residual — caller adds in fp32)
+    // Wo is [dim, dim] fp16, attn is [dim] fp32. Parallel across output rows.
     int D = c->dim;
-    for (int i = 0; i < D; i++) {
-        float val = 0;
-        for (int j = 0; j < D; j++)
-            val += (float)wo[i * D + j] * scratch->attn_f32[j];
+    dispatch_apply(D, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t i) {
+        const _Float16 *row = wo + i * D;
+        const float *src = scratch->attn_f32;
+        int j = 0;
+        float32x4_t acc0 = vdupq_n_f32(0), acc1 = vdupq_n_f32(0);
+        for (; j + 7 < D; j += 8) {
+            float16x8_t w = vld1q_f16((const __fp16*)(row + j));
+            float32x4_t wl = vcvt_f32_f16(vget_low_f16(w));
+            float32x4_t wh = vcvt_f32_f16(vget_high_f16(w));
+            acc0 = vfmaq_f32(acc0, wl, vld1q_f32(src + j));
+            acc1 = vfmaq_f32(acc1, wh, vld1q_f32(src + j + 4));
+        }
+        float val = vaddvq_f32(vaddq_f32(acc0, acc1));
+        for (; j < D; j++) val += (float)row[j] * src[j];
         out[i] = (_Float16)val;
-    }
+    });
 }
