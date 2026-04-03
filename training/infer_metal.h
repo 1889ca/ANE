@@ -11,7 +11,9 @@ static NSString *const metal_shader_source = @R"(
 using namespace metal;
 
 // Matrix-vector multiply: one simdgroup (32 threads) per output row
-// 32 threads stride through K elements, reduce via simd_sum
+// 32 threads stride through K elements with half4 loads, reduce via simd_sum
+// AMX simdgroup_matrix was tested but threadgroup broadcast overhead
+// for the x vector tile outweighed the AMX throughput gain.
 kernel void matvec_f16(
     device const half *W [[buffer(0)]],
     device const half *x [[buffer(1)]],
