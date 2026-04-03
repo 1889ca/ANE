@@ -4,7 +4,7 @@ FRAMEWORKS = -framework Foundation -framework CoreML -framework IOSurface
 LDFLAGS = $(FRAMEWORKS) -ldl
 
 HEADERS_LARGE = stories_config.h stories_io.h stories_mil.h stories_cpu_ops.h
-HEADERS_INFER = infer_config.h kv_cache.h infer_mil.h bonsai_lora.h stories_io.h stories_config.h infer_tokenizer.h infer_xor_patch.h
+HEADERS_INFER = infer_config.h kv_cache.h infer_mil.h bonsai_lora.h stories_io.h stories_config.h infer_tokenizer.h infer_xor_patch.h infer_metal.h
 
 train: train.m ane_runtime.h ane_mil_gen.h model.h forward.h backward.h
 	$(CC) $(CFLAGS) -o $@ train.m $(LDFLAGS)
@@ -13,7 +13,7 @@ train_large: train_large.m $(HEADERS_LARGE)
 	$(CC) $(CFLAGS) -o $@ train_large.m $(LDFLAGS) -framework Accelerate
 
 infer: infer.m $(HEADERS_INFER)
-	$(CC) $(CFLAGS) -o $@ infer.m $(LDFLAGS) -framework Accelerate
+	$(CC) $(CFLAGS) -o $@ infer.m $(LDFLAGS) -framework Accelerate -framework Metal
 
 tokenize:
 	python3 tokenize.py

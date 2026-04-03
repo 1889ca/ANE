@@ -30,6 +30,7 @@
 #include "bonsai_lora.h"
 #include "infer_tokenizer.h"
 #include "infer_xor_patch.h"
+#include "infer_metal.h"
 
 // ========== QK Norm (Qwen3) ==========
 // Per-head RMSNorm on Q[dim] and K[kv_dim] with learned weights[head_dim]
@@ -400,6 +401,7 @@ int main(int argc, char **argv) {
     _Float16 **wo_weights = NULL; // [n_layers] Wo weight arrays for CPU attention
     InferLayerKernels *layers = NULL;
     _Float16 *rms_final_w = NULL;
+    MetalFFN *metal_ffn = NULL;  // Metal FFN for large models (NULL = use ANE)
 
     if (use_stories) {
         // ====== Stories110M path (for testing) ======
@@ -588,7 +590,10 @@ int main(int argc, char **argv) {
         rms_final_w = gguf_load_as_f16(gf, "output_norm.weight", &rr, &rc);
         if (!rms_final_w) { fprintf(stderr, "Failed to load output_norm\n"); return 1; }
 
-        // Compile ANE kernels per layer
+        // Init Metal FFN
+        metal_ffn = metal_ffn_init(&cfg);
+
+        // Compile ANE kernels per layer (QKV + Wo on ANE, FFN on Metal)
         printf("Compiling %d layers...\n", cfg.n_layers);
         layers = (InferLayerKernels *)calloc(cfg.n_layers, sizeof(InferLayerKernels));
         wo_weights = (_Float16 **)calloc(cfg.n_layers, sizeof(_Float16*));
@@ -673,14 +678,19 @@ int main(int argc, char **argv) {
             };
             layers[L].wo = compile_kern_mil_w(wo_mil, wo_w, cfg.dim*io_s*2, cfg.dim*io_s*2);
 
-            // FFN kernel (no RMSNorm, no residual)
-            NSString *ffn_mil = gen_infer_ffn(&cfg, io_s);
-            NSDictionary *ffn_w = @{
-                @"@model_path/weights/w1.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(w1_f16, cfg.hidden_dim, cfg.dim)},
-                @"@model_path/weights/w3.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(w3_f16, cfg.hidden_dim, cfg.dim)},
-                @"@model_path/weights/w2.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(w2_f16, cfg.dim, cfg.hidden_dim)},
-            };
-            layers[L].ffn = compile_kern_mil_w(ffn_mil, ffn_w, cfg.dim*io_s*2, cfg.dim*io_s*2);
+            // FFN on Metal GPU (not ANE — too slow for 300MB weights)
+            if (metal_ffn) {
+                metal_ffn_load_layer(metal_ffn, L, w1_f16, w3_f16, w2_f16);
+                layers[L].ffn = NULL;  // no ANE FFN kernel
+            } else {
+                NSString *ffn_mil = gen_infer_ffn(&cfg, io_s);
+                NSDictionary *ffn_w = @{
+                    @"@model_path/weights/w1.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(w1_f16, cfg.hidden_dim, cfg.dim)},
+                    @"@model_path/weights/w3.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(w3_f16, cfg.hidden_dim, cfg.dim)},
+                    @"@model_path/weights/w2.bin": @{@"offset":@0, @"data":bonsai_build_blob_fp16(w2_f16, cfg.dim, cfg.hidden_dim)},
+                };
+                layers[L].ffn = compile_kern_mil_w(ffn_mil, ffn_w, cfg.dim*io_s*2, cfg.dim*io_s*2);
+            }
 
             // Store RMS norm weights for CPU, QK norm weights
             layers[L].rms_att = rms1; rms1 = NULL;
@@ -688,7 +698,7 @@ int main(int argc, char **argv) {
             layers[L].q_norm = qnorm;
             layers[L].k_norm = knorm;
 
-            // Free weights baked into kernels
+            // Free weights (baked into ANE kernels or copied to Metal buffers)
             free(wq_f16); free(wk_f16); free(wv_f16); free(wo_f16);
             free(w1_f16); free(w2_f16); free(w3_f16);
         }
@@ -834,25 +844,33 @@ int main(int argc, char **argv) {
 
 
             uint64_t t3 = mach_absolute_time();
-            // CPU RMSNorm (fp32→fp16) then FFN on ANE
+            // CPU RMSNorm then FFN (Metal GPU or ANE)
             rmsnorm_f32_to_f16(cfg.dim, x_f16, x, layers[L].rms_ffn);
 
-            IOSurfaceLock(layers[L].ffn->ioIn, 0, NULL);
-            _Float16 *ffn_inp = (_Float16*)IOSurfaceGetBaseAddress(layers[L].ffn->ioIn);
-            memset(ffn_inp, 0, cfg.dim * DECODE_S * sizeof(_Float16));
-            for (int ci = 0; ci < cfg.dim; ci++)
-                ffn_inp[ci * DECODE_S] = x_f16[ci];
-            IOSurfaceUnlock(layers[L].ffn->ioIn, 0, NULL);
-
             ta = mach_absolute_time();
-            ane_eval(layers[L].ffn);
-            tb = mach_absolute_time();
+            if (metal_ffn) {
+                // Metal GPU FFN
+                metal_ffn_eval(metal_ffn, L, x_f16, delta_f16);
+                for (int ci = 0; ci < cfg.dim; ci++)
+                    x[ci] += (float)delta_f16[ci];  // residual add in fp32
+            } else {
+                // ANE FFN
+                IOSurfaceLock(layers[L].ffn->ioIn, 0, NULL);
+                _Float16 *ffn_inp = (_Float16*)IOSurfaceGetBaseAddress(layers[L].ffn->ioIn);
+                memset(ffn_inp, 0, cfg.dim * DECODE_S * sizeof(_Float16));
+                for (int ci = 0; ci < cfg.dim; ci++)
+                    ffn_inp[ci * DECODE_S] = x_f16[ci];
+                IOSurfaceUnlock(layers[L].ffn->ioIn, 0, NULL);
 
-            IOSurfaceLock(layers[L].ffn->ioOut, kIOSurfaceLockReadOnly, NULL);
-            const _Float16 *ffn_outp = (const _Float16*)IOSurfaceGetBaseAddress(layers[L].ffn->ioOut);
-            for (int ci = 0; ci < cfg.dim; ci++)
-                x[ci] += (float)ffn_outp[ci * DECODE_S];  // residual add in fp32
-            IOSurfaceUnlock(layers[L].ffn->ioOut, kIOSurfaceLockReadOnly, NULL);
+                ane_eval(layers[L].ffn);
+
+                IOSurfaceLock(layers[L].ffn->ioOut, kIOSurfaceLockReadOnly, NULL);
+                const _Float16 *ffn_outp = (const _Float16*)IOSurfaceGetBaseAddress(layers[L].ffn->ioOut);
+                for (int ci = 0; ci < cfg.dim; ci++)
+                    x[ci] += (float)ffn_outp[ci * DECODE_S];
+                IOSurfaceUnlock(layers[L].ffn->ioOut, kIOSurfaceLockReadOnly, NULL);
+            }
+            tb = mach_absolute_time();
 
             uint64_t t4 = mach_absolute_time();
             t_ane += tb_ms(t1 - t0) + tb_ms(t4 - t3);  // QKV + FFN ANE
@@ -939,6 +957,7 @@ int main(int argc, char **argv) {
     }
     free(layers);
     if (wo_weights) free(wo_weights);
+    metal_ffn_free(metal_ffn);
     tokenizer_free(tokenizer);
     bpe_tokenizer_free(bpe_tokenizer);
 
